@@ -796,6 +796,7 @@ static bool PpuViewportAllows(Ppu *ppu, uint layer, int screen_x,
 static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
                                    uint y, bool sub, uint layer,
                                    PpuZbufType zhi, PpuZbufType zlo) {
+  const int screen_y = (int)y;
 #define VIEWPORT_ALLOWED(i) \
   PpuViewportAllows(ppu, layer, \
       (int)(dstz + (i) - dstbuf->data - kPpuExtraLeftRight), \
@@ -828,7 +829,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
   const uint16 *addr;
   bool ws_shadow = WsShadowLayerActive(layer);
-#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - PpuRenderVram(ppu)), (uint16_t)(t)) : (uint32)(t))
+#define WS_TILE(t, sx, span) (ws_shadow ? WsShadowTileDebug(layer, (sx), screen_y, (span), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - PpuRenderVram(ppu)), (uint16_t)(t)) : (uint32)(t))
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
@@ -844,7 +845,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     if (x & 7) {
       int curw = IntMin(8 - (x & 7), w);
       w -= curw;
-      uint32 tile = WS_TILE(*tp, ws_sx);
+      uint32 tile = WS_TILE(*tp, ws_sx, curw);
       ws_sx += curw;
       NEXT_TP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
@@ -865,7 +866,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     }
     // Handle full tiles in the middle
     while (w >= 8) {
-      uint32 tile = WS_TILE(*tp, ws_sx);
+      uint32 tile = WS_TILE(*tp, ws_sx, 8);
       NEXT_TP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
@@ -884,7 +885,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     }
     // Handle remaining clipped part
     if (w) {
-      uint32 tile = WS_TILE(*tp, ws_sx);
+      uint32 tile = WS_TILE(*tp, ws_sx, (int)w);
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -1016,9 +1017,10 @@ static void PpuDrawBackgroundBig(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
        * Using live hScroll/vScroll for px/py while the tile key used the
        * NMI-latched world origin produced a persistent ~phase seam. */
       if (ws_shadow && (screen_x < 0 || screen_x >= 256)) {
-        tile = WsShadowTile((int)layer, screen_x, (uint32_t)sy,
-                            (uint16_t)ppu->hScroll[layer],
-                            (uint16_t)(sc & 0x7fff), tile);
+        tile = WsShadowTileDebug((int)layer, screen_x, (int)y, 1,
+                                 (uint32_t)sy,
+                                 (uint16_t)ppu->hScroll[layer],
+                                 (uint16_t)(sc & 0x7fff), tile);
         const int32_t wpx =
             (int32_t)WsShadowWorldX((int)layer) + screen_x;
         const int32_t wpy =
@@ -1384,6 +1386,7 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
                                           PpuPixelPrioBufs *dstbuf, uint y,
                                           bool sub, uint layer,
                                           PpuZbufType zhi, PpuZbufType zlo) {
+  const int screen_y = (int)y;
 #define VIEWPORT_ALLOWED(i) \
   PpuViewportAllows(ppu, layer, \
       (int)(dstz + (i) - dstbuf->data - kPpuExtraLeftRight), \
@@ -1408,7 +1411,7 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
   const uint16 *addr;
   bool ws_shadow = WsShadowLayerActive(layer);
-#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - PpuRenderVram(ppu)), (uint16_t)(t)) : (uint32)(t))
+#define WS_TILE(t, sx, span) (ws_shadow ? WsShadowTileDebug(layer, (sx), screen_y, (span), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - PpuRenderVram(ppu)), (uint16_t)(t)) : (uint32)(t))
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
@@ -1424,7 +1427,7 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
     int w = mosaic_size - (sx - PpuMosaicAt(ppu, sx));
     do {
       w = IntMin(w, dstz_end - dstz);
-      uint32 tile = WS_TILE(*tp, ws_sx);
+      uint32 tile = WS_TILE(*tp, ws_sx, w);
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
