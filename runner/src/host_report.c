@@ -50,7 +50,11 @@
 #endif
 #else
 #include <pthread.h>
+#ifndef __SWITCH__
+/* newlib on Horizon has no uname(2); the __SWITCH__ OS branch below
+ * reports the platform statically. */
 #include <sys/utsname.h>
+#endif
 #include <unistd.h>
 #if defined(__linux__)
 #include <link.h>
@@ -284,6 +288,14 @@ static void dump_os_json(FILE *f) {
         (unsigned long long)(ms.ullTotalPhys >> 20),
         (unsigned long long)(ms.ullAvailPhys >> 20));
 #else
+#ifdef __SWITCH__
+    char brand[64], esc_brand[128];
+    dump_cpu_brand(brand, sizeof(brand));
+    hr_json_escape(brand, esc_brand, sizeof(esc_brand));
+    fprintf(f, "  \"os\": {\"platform\": \"horizon\", \"arch\": \"aarch64\","
+            " \"cpu_brand\": \"%s\"},\n",
+            esc_brand);
+#else
     struct utsname un;
     char brand[64], esc_brand[128];
     dump_cpu_brand(brand, sizeof(brand));
@@ -301,6 +313,7 @@ static void dump_os_json(FILE *f) {
         fprintf(f, "  \"os\": {\"platform\": \"posix\", \"cpu_brand\": \"%s\"},\n",
                 esc_brand);
     }
+#endif
 #endif
 }
 

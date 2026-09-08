@@ -349,8 +349,15 @@ void NORETURN Die(const char *error) {
    * includes it and preserves a timestamped crash copy (see
    * host_report_has_fatal in post_mortem.c). */
   host_report_fatal(error);
+#ifdef __SWITCH__
+  /* Switch SDL2 has no message-box implementation; the error is already
+   * in the breadcrumb ring + stderr/nxlink, and ROM-missing additionally
+   * persists MISSING_ROM.txt on the SD card. */
+  fprintf(stderr, "Error: %s\n", error);
+#else
   SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, kWindowTitle, error, NULL);
   fprintf(stderr, "Error: %s\n", error);
+#endif
   exit(1);
 }
 
@@ -820,10 +827,12 @@ int main(int argc, char** argv) {
    * (verified via the SNESRECOMP_CRASH_TEST drill). Leaving it out
    * routes AVs to seh_handler below with the full exception record.
    * SIGABRT stays: abort() never raises an SEH exception. */
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH__)
   signal(SIGSEGV, crash_handler);
 #endif
+#ifndef __SWITCH__
   signal(SIGABRT, crash_handler);
+#endif
 #ifdef _WIN32
   SetUnhandledExceptionFilter(seh_handler);
   /* Suppress the Windows error dialog so SEH unwinds straight to our
@@ -831,7 +840,9 @@ int main(int argc, char** argv) {
    * having to dismiss a popup first. */
   SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 #endif
+#ifndef __SWITCH__
   atexit(post_mortem_atexit);
+#endif
   host_report_init(MMX_GAME_NAME " " MMX_GAME_REGION, SNESRECOMP_BUILD_VERSION);
   /* ARM the backwards watcher BEFORE any recompiled code runs. Without
    * this, the trace ring records but no tripwires fire. With this:
@@ -1087,6 +1098,20 @@ int main(int argc, char** argv) {
 #endif
 
     if (!rom_resolved_by_launcher) {
+#ifdef __SWITCH__
+    /* Switch: no launcher GUI, no console picker (no stdin in applet
+     * mode). ROM comes from the SD app dir — sdmc:/switch/<app>/rom.sfc
+     * — with romfs:/ as a dev fallback. See switch/switch_impl.c. */
+    {
+      const char *positional =
+          (argc >= 1 && argv[0]) ? argv[0] : "";
+      if (!SwitchImpl_ResolveRom(rom_path_buf, sizeof(rom_path_buf),
+                                 positional[0] ? positional : NULL)) {
+        ThrowMissingROM();
+        return 1;
+      }
+    }
+#else
     char *la_argv[2] = {
       (char *)"mmx",
       (char *)((argc >= 1 && argv[0]) ? argv[0] : "")
@@ -1097,14 +1122,18 @@ int main(int argc, char** argv) {
       /* User cancelled the picker or repeatedly chose a non-matching ROM. */
       return 1;
     }
+#endif
     }
   }
-  /* Issue #4: co-locate the ROM with the exe (interactive launches only). */
+#ifndef __SWITCH__
+  /* Issue #4: co-locate the ROM with the exe (interactive launches only).
+   * Switch skips this: the ROM already lives in sdmc:/switch/<app>/. */
   if (!start_paused && script_file == NULL && framedump_dir == NULL) {
     if (RelocateRomToExeDir(rom_path_buf, sizeof(rom_path_buf))) {
       snesrecomp_rom_cache_write(rom_path_buf);
     }
   }
+#endif
 #if SNESRECOMP_ENABLE_MODS
   if (mods_ready) {
     if (!snes_mod_runtime_commit_c(rom_path_buf)) {
@@ -1150,10 +1179,12 @@ int main(int argc, char** argv) {
   g_ppu_render_flags = g_config.new_renderer * kPpuRenderFlags_NewRenderer |
     g_config.no_sprite_limits * kPpuRenderFlags_NoSpriteLimits;
 
+#ifndef __SWITCH__
   if (g_config.fullscreen == 1)
     g_win_flags ^= SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP;
   else if (g_config.fullscreen == 2)
     g_win_flags ^= SDL_WINDOW_FULLSCREEN;
+#endif
 
   // Window scale (1=100%, 2=200%, 3=300%, etc.)
   g_current_window_scale = (g_config.window_scale == 0) ? 2 : IntMin(g_config.window_scale, kMaxWindowScale);
@@ -1188,18 +1219,33 @@ int main(int argc, char** argv) {
    * anchored there; on read-only installs it tracks the config). */
   keybinds_init(NULL);
 
+#ifdef __SWITCH__
+  /* Switch: fixed 720p window. SDL2 on Switch only exposes 1280x720 and
+   * 1920x1080 modes; 720p is the safe default (docked + handheld) and
+   * the SDL renderer (GLES2) scales the SNES frame to it. */
+  int window_width = 1280;
+  int window_height = 720;
+#else
   bool custom_size = g_config.window_width != 0 && g_config.window_height != 0;
   int window_width = custom_size ? g_config.window_width :
       g_current_window_scale * MmxDisplay_GetWindowBaseWidth(g_snes_width);
   int window_height = custom_size ? g_config.window_height :
       g_current_window_scale * MmxDisplay_GetWindowBaseHeight();
+#endif
 
+#ifdef __SWITCH__
+  /* Switch always uses the SDL renderer path: on Switch SDL2 that IS the
+   * OpenGL path (accelerated GLES2). A game-side OpenGLRenderer_Create
+   * written against desktop GL would not compile/link here. */
+  g_renderer_funcs = kSdlRendererFuncs;
+#else
   if (g_config.output_method == kOutputMethod_OpenGL) {
     g_win_flags |= SDL_WINDOW_OPENGL;
     OpenGLRenderer_Create(&g_renderer_funcs);
   } else {
     g_renderer_funcs = kSdlRendererFuncs;
   }
+#endif
 
   /* Load the SNES ROM. argv[0] is the launcher-resolved path (always
    * non-NULL after snesrecomp_launcher_resolve_rom returned success). */
@@ -1287,7 +1333,9 @@ error_reading:;
     return 1;
   }
   g_window = window;
+#ifndef __SWITCH__
   SDL_SetWindowHitTest(window, HitTestCallback, NULL);
+#endif
   host_report_breadcrumb("window created: %dx%d flags=0x%x",
                          window_width, window_height, g_win_flags);
 
@@ -1351,7 +1399,21 @@ error_reading:;
     if (g_audio_device == 0) {
       host_report_breadcrumb("audio device open FAILED: %s", SDL_GetError());
       printf("Failed to open audio device: %s\n", SDL_GetError());
+#ifdef __SWITCH__
+      /* Homebrew robustness: run silent rather than refuse to boot when
+       * the audren backend is busy (e.g. applet-mode audio limits). No
+       * device means the mixer callback never fires, so zero the spec
+       * the tail below consumes (RtlSetAudioOutputRate ignores 0) and
+       * leave the buffer NULL; cleanup already tolerates that. */
+      SDL_memset(&have, 0, sizeof(have));
+      g_audio_channels = 2;
+      g_frames_per_block = 0;
+      g_audiobuffer = NULL;
+      g_audiobuffer_cur = NULL;
+      g_audiobuffer_end = NULL;
+#else
       return 1;
+#endif
     }
     g_audio_channels = 2;
     /* One native DSP block is 534 samples at the SPC's true output rate
@@ -1443,6 +1505,14 @@ error_reading:;
      * whole crash-capture pipeline (minidump + report + crash copy). */
     host_report_crash_test_tick();
 
+#ifdef __SWITCH__
+    /* Home-button / suspend pump (libnx kills titles that starve
+     * appletMainLoop). SDL_QUIT from the Switch video driver covers the
+     * same request asynchronously; this is the synchronous half. */
+    if (!SwitchImpl_Tick())
+      break;
+#endif
+
     while (SDL_PollEvent(&event)) {
       switch (event.type) {
       case SDL_CONTROLLERDEVICEADDED:
@@ -1505,10 +1575,13 @@ error_reading:;
         }
         break;
       case SDL_MOUSEWHEEL:
+#ifndef __SWITCH__
         if (SDL_GetModState() & KMOD_CTRL && event.wheel.y != 0)
           ChangeWindowScale(event.wheel.y > 0 ? 1 : -1);
+#endif
         break;
       case SDL_MOUSEBUTTONDOWN:
+#ifndef __SWITCH__
         /* SDL3 replaced SDL_MouseButtonEvent.state/SDL_PRESSED with a bool
      * `down`; the event type already tells us it is a press. */
     if (event.button.button == SDL_BUTTON_LEFT && event.button.clicks == 2) {
@@ -1517,6 +1590,7 @@ error_reading:;
             SDL_SetWindowBordered(g_window, (g_win_flags & SDL_WINDOW_BORDERLESS) == 0 ? SDL_TRUE : SDL_FALSE);
           }
         }
+#endif
         break;
       case SDL_KEYDOWN:
         HandleInput(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_MOD(event), true);
@@ -1698,7 +1772,8 @@ error_reading:;
   SDL_DestroyAudioStream(g_audio_stream);
   g_audio_stream = NULL;
 #else
-  SDL_CloseAudioDevice(g_audio_device);
+  if (g_audio_device)
+    SDL_CloseAudioDevice(g_audio_device);
 #endif
   SDL_DestroyMutex(g_audio_mutex);
   free(g_audiobuffer);
@@ -1791,10 +1866,12 @@ static void HandleCommand(uint32 j, bool pressed) {
   } else {
     switch (j) {
     case kKeys_Fullscreen:
+#ifndef __SWITCH__
       g_win_flags ^= SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP;
       SDL_SetWindowFullscreen(g_window, g_win_flags & SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP);
       g_cursor = !g_cursor;
       snesrecomp_sdl_show_cursor(g_cursor);
+#endif
       break;
     case kKeys_Reset:
       RtlReset(1);
@@ -1813,8 +1890,16 @@ static void HandleCommand(uint32 j, bool pressed) {
       }
 #endif
       break;
-    case kKeys_WindowBigger: ChangeWindowScale(1); break;
-    case kKeys_WindowSmaller: ChangeWindowScale(-1); break;
+    case kKeys_WindowBigger:
+#ifndef __SWITCH__
+      ChangeWindowScale(1);
+#endif
+      break;
+    case kKeys_WindowSmaller:
+#ifndef __SWITCH__
+      ChangeWindowScale(-1);
+#endif
+      break;
     case kKeys_DisplayPerf: g_display_perf ^= 1; break;
     case kKeys_ToggleRenderer:
       g_ppu_render_flags ^= kPpuRenderFlags_NewRenderer;

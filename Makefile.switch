@@ -1,0 +1,207 @@
+# Makefile.switch — Nintendo Switch (libnx) template for SNESRecomp games.
+#
+# Copy this file into a game repository as `Makefile` (same directory that
+# holds the desktop CMakeLists.txt) and adjust the GAME_* knobs below.
+# Requires devkitA64 + switch portlibs SDL2 (devkitPro pacman:
+#   dka64 / switch-dev / switch-sdl2).
+#
+# Build:
+#   make -f Makefile.switch            # -> <target>.nro + <target>.nacp
+#   make -f Makefile.switch clean
+#
+# Run: copy <target>.nro to sdmc:/switch/<app>/ and place the ROM at
+#   sdmc:/switch/<app>/rom.sfc   (.smc with copier header also accepted)
+# SWITCH_APP_DIR defaults to the target name (e.g. dkc2 -> sdmc:/switch/dkc2/).
+#
+# Video is SDL2 + OpenGL: on Switch, SDL_RENDERER_ACCELERATED is a GLES2
+# renderer, so the shared SDL texture presenter is the OpenGL path — no
+# game-side OpenGLRenderer_Create is used or linked on __SWITCH__.
+# Audio is the SDL2 pull callback (audren backend). Input is SDL
+# joystick/gamecontroller (Joy-Cons + Pro Controller via SDL mappings).
+#
+# Out of scope on Switch (compiled out, see docs/SWITCH.md): GUI launcher
+# + file picker, TCP debug server, co-sim, snes9x oracle, mods, GLSL
+# shaders, post-mortem minidumps.
+
+.SUFFIXES:
+
+ifeq ($(strip $(DEVKITPRO)),)
+$(error "Please set DEVKITPRO in your environment. export DEVKITPRO=<path to>/devkitpro")
+endif
+
+TOPDIR ?= $(CURDIR)
+export TOPDIR
+include $(DEVKITPRO)/libnx/switch_rules
+
+# ── Game knobs ──────────────────────────────────────────────────────────
+TARGET		:=	dkc2
+APP_TITLE	:=	DKC2 Recomp
+APP_AUTHOR	:=	SNESRecomp
+APP_VERSION	:=	1.0.0
+
+# SD layout: sdmc:/switch/<SWITCH_APP_DIR>/rom.sfc (+config.ini, saves/).
+# Default follows the target name: TARGET=dkc2 -> sdmc:/switch/dkc2/.
+SWITCH_APP_DIR	?=	$(TARGET)
+
+# Path to the snesrecomp framework checkout (this repo).
+# Base custom paths on $(TOPDIR) (stable in both make passes) or use an
+# absolute path; a bare relative path would resolve against the build dir
+# on the second pass.
+SNESRECOMP_ROOT	?=	$(TOPDIR)/../snesrecomp
+export SNESRECOMP_ROOT
+include $(SNESRECOMP_ROOT)/runner/switch.mk
+
+# Game sources: generated recomp C (src/gen/*.c), the host wrapper .c that
+# defines the MMX_* macros and #includes desktop/mmx23_host_main.inc, and
+# any game integration .c files. Use TOPDIR-based or absolute paths (a bare
+# relative path resolves against the build dir on the second make pass).
+# Basenames must be unique across game + runner files.
+GAME_CFILES	:=
+# Game header dirs (dirs holding MMX_RTL_HEADER, MMX_DISPLAY_HEADER, ...).
+# Keep game dirs first (a game config.h must beat the framework's
+# desktop/config.h), but put the framework before any third-party dir that
+# ships colliding bare headers (recomp-ui/src/common has its own
+# sha256.h/crc32.h) — split into two lists if yours does:
+#   GAME_INCLUDES_EARLY (game) + framework + GAME_INCLUDES_LATE (third-party).
+GAME_INCLUDES	:=	$(TOPDIR)/include
+# Extra game defines (e.g. -DMMX_GAME_NAME='"DKC2"').
+GAME_DEFS	:=
+
+# Optional: data files + RomFS content (baked-in dev assets; a test ROM
+# can ride here as romfs:/rom.sfc — the resolver probes it as fallback).
+# Leave ROMFS empty unless the directory exists (elf2nro errors on a
+# missing --romfsdir).
+DATA		:=	data
+ROMFS		:=
+
+BUILD		:=	build
+# ─────────────────────────────────────────────────────────────────────────
+
+ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
+
+CFILES		:=	$(GAME_CFILES) $(SNESRECOMP_SWITCH_CFILES)
+
+# Flattened objects (devkitPro convention): basenames must be unique.
+# sort() dedups, so a word-count mismatch means a collision.
+_BASENAMES	:=	$(notdir $(CFILES))
+ifneq ($(words $(_BASENAMES)),$(words $(sort $(_BASENAMES))))
+$(error "duplicate .c basenames across GAME_CFILES + runner sources")
+endif
+
+INCLUDE		:=	$(foreach dir,$(GAME_INCLUDES),-I$(dir)) \
+			$(foreach dir,$(SNESRECOMP_SWITCH_INCLUDES),-I$(dir)) \
+			-I$(TOPDIR)/$(BUILD)
+
+DEFINES		:=	$(SNESRECOMP_SWITCH_DEFS) $(GAME_DEFS) \
+			-DSWITCH_APP_DIR='"$(SWITCH_APP_DIR)"'
+
+CFLAGS		:=	-g -Wall -O2 -ffunction-sections \
+			$(ARCH) $(DEFINES) $(INCLUDE) `sdl2-config --cflags`
+
+CXXFLAGS	:=	$(CFLAGS) -fno-rtti -fno-exceptions
+
+ASFLAGS		:=	-g $(ARCH)
+LDFLAGS		=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) \
+			-Wl,-Map,$(notdir $*.map)
+
+LIBS		:=	`sdl2-config --libs` -lm
+
+LIBDIRS		:=	$(PORTLIBS) $(LIBNX)
+
+# ── devkitPro build boilerplate (explicit-file-list flavor) ─────────────
+ifneq ($(BUILD),$(notdir $(CURDIR)))
+
+export OUTPUT	:=	$(TOPDIR)/$(TARGET)
+
+export VPATH	:=	$(sort $(dir $(CFILES))) \
+			$(foreach dir,$(DATA),$(TOPDIR)/$(dir))
+
+export DEPSDIR	:=	$(TOPDIR)/$(BUILD)
+
+export OFILES_BIN	:=	$(addsuffix .o,$(notdir $(wildcard $(foreach dir,$(DATA),$(dir)/*.*))))
+export OFILES_SRC	:=	$(notdir $(CFILES:.c=.o))
+export OFILES		:=	$(OFILES_BIN) $(OFILES_SRC)
+export HFILES_BIN	:=	$(addsuffix .h,$(subst .,_,$(notdir $(wildcard $(foreach dir,$(DATA),$(dir)/*.*)))))
+
+# Link with CC (no C++ in the Switch build); games adding .cpp must
+# switch this to $(CXX) like the stock devkitPro template does.
+export LD	:=	$(CC)
+
+export INCLUDE	:=	$(INCLUDE)
+export LIBPATHS	:=	$(foreach dir,$(LIBDIRS),-L$(dir)/lib)
+
+ifeq ($(strip $(ICON)),)
+	icons := $(wildcard *.jpg)
+	ifneq (,$(findstring $(TARGET).jpg,$(icons)))
+		export APP_ICON := $(TOPDIR)/$(TARGET).jpg
+	else
+		ifneq (,$(findstring icon.jpg,$(icons)))
+			export APP_ICON := $(TOPDIR)/icon.jpg
+		endif
+	endif
+else
+	export APP_ICON := $(TOPDIR)/$(ICON)
+endif
+
+ifeq ($(strip $(NO_ICON)),)
+	export NROFLAGS += --icon=$(APP_ICON)
+endif
+
+ifeq ($(strip $(NO_NACP)),)
+	export NROFLAGS += --nacp=$(TOPDIR)/$(TARGET).nacp
+endif
+
+ifneq ($(APP_TITLEID),)
+	export NACPFLAGS += --titleid=$(APP_TITLEID)
+endif
+
+ifneq ($(ROMFS),)
+	export NROFLAGS += --romfsdir=$(TOPDIR)/$(ROMFS)
+endif
+
+.PHONY: $(BUILD) clean all
+
+all: $(BUILD)
+
+$(BUILD):
+	@[ -d $@ ] || mkdir -p $@
+	@$(MAKE) --no-print-directory -C $(BUILD) -f $(TOPDIR)/Makefile.switch
+
+clean:
+	@echo clean ...
+	@rm -fr $(BUILD) $(TARGET).nro $(TARGET).nacp $(TARGET).elf
+
+else
+
+.PHONY:	all
+
+DEPENDS	:=	$(OFILES:.o=.d)
+
+all	:	$(OUTPUT).nro
+
+ifeq ($(strip $(NO_NACP)),)
+$(OUTPUT).nro	:	$(OUTPUT).elf
+else
+$(OUTPUT).nro	:	$(OUTPUT).elf $(OUTPUT).nacp
+endif
+
+# Explicit link through a response file: generated recomp trees put
+# hundreds of objects on the link line, past Windows' CreateProcess
+# limit ("Argument list too long"). This overrides switch_rules' %.elf
+# pattern rule with the same recipe shape.
+$(OUTPUT).elf	:	$(OFILES)
+	@echo linking $(notdir $@)
+	@rm -f $(DEPSDIR)/objects.rsp
+	@$(foreach o,$(OFILES),echo $(o) >> $(DEPSDIR)/objects.rsp;)
+	@$(LD) $(LDFLAGS) @$(DEPSDIR)/objects.rsp $(LIBPATHS) $(LIBS) -o $@
+	@$(NM) -CSn $@ > $(OUTPUT).lst
+
+$(OFILES_SRC)	:	$(HFILES_BIN)
+
+%.bin.o	%_bin.h :	%.bin
+	@echo $(notdir $<)
+	@$(bin2o)
+
+-include $(DEPENDS)
+
+endif
