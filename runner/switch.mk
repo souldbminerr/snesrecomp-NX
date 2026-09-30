@@ -25,6 +25,10 @@
 # and on Switch SDL_RENDERER_ACCELERATED is GLES2 — the shared SDL
 # texture presenter IS the OpenGL path, no custom GL needed.
 
+# Neutralize SDL2's Switch keyboard pump (see __wrap_swkbdInlineUpdate in
+# src/switch/switch_impl.c). Game Makefiles append this to LDFLAGS.
+SNESRECOMP_SWITCH_WRAP := -Wl,--wrap,swkbdInlineUpdate
+
 SNESRECOMP_SWITCH_ROOT := $(dir $(lastword $(MAKEFILE_LIST)))
 
 SNESRECOMP_SWITCH_CFILES := \
@@ -32,7 +36,6 @@ SNESRECOMP_SWITCH_CFILES := \
 	$(SNESRECOMP_SWITCH_ROOT)src/common_rtl.c \
 	$(SNESRECOMP_SWITCH_ROOT)src/widescreen.c \
 	$(SNESRECOMP_SWITCH_ROOT)src/recomp_hw.c \
-	$(SNESRECOMP_SWITCH_ROOT)src/framedump.c \
 	$(SNESRECOMP_SWITCH_ROOT)src/host_paths.c \
 	$(SNESRECOMP_SWITCH_ROOT)src/launcher.c \
 	$(SNESRECOMP_SWITCH_ROOT)src/launcher_cache.c \

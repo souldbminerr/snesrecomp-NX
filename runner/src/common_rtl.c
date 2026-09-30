@@ -1820,9 +1820,29 @@ void RtlMigrateLegacySram(const char *legacy_title) {
   fprintf(stderr, "[saves] migrated legacy %s -> %s\n", legacy, cur_path);
 }
 
+#ifdef __SWITCH__
+/* FNV-1a over the live SRAM image so the save log shows whether real
+ * game data or untouched zeros are being persisted and loaded. */
+static uint32_t snesrecomp_sram_hash(void) {
+  uint32_t h = 2166136261u;
+  int i;
+  if (!g_sram || g_sram_size <= 0) return 0;
+  for (i = 0; i < g_sram_size; i++) {
+    h ^= g_sram[i];
+    h *= 16777619u;
+  }
+  return h;
+}
+#endif
+
 void RtlReadSram(void) {
-  if (!g_sram || g_sram_size <= 0)
+  if (!g_sram || g_sram_size <= 0) {
+#ifdef __SWITCH__
+    fprintf(stderr, "[saves] read skipped (no SRAM: size=%d)\n",
+            g_sram_size);
+#endif
     return;
+  }
   char path[128];
   RtlMigrateLegacySram(g_rtl_game_info->title);
   RtlSramFilePath(path, sizeof(path));
@@ -1830,13 +1850,28 @@ void RtlReadSram(void) {
   if (f) {
     if (fread(g_sram, 1, g_sram_size, f) != g_sram_size)
       fprintf(stderr, "Error reading %s\n", path);
+#ifdef __SWITCH__
+    else
+      fprintf(stderr, "[saves] read %s (%d bytes, hash=%08x)\n", path,
+              g_sram_size, snesrecomp_sram_hash());
+#endif
     fclose(f);
   }
+#ifdef __SWITCH__
+  else {
+    fprintf(stderr, "[saves] no save yet (%s)\n", path);
+  }
+#endif
 }
 
 void RtlWriteSram(void) {
-  if (!g_sram || g_sram_size <= 0)
+  if (!g_sram || g_sram_size <= 0) {
+#ifdef __SWITCH__
+    fprintf(stderr, "[saves] write skipped (no SRAM: size=%d)\n",
+            g_sram_size);
+#endif
     return;
+  }
   char path[128], bak[140];
   RtlEnsureSaveDir();
   RtlSramFilePath(path, sizeof(path));
@@ -1846,6 +1881,10 @@ void RtlWriteSram(void) {
   if (f) {
     fwrite(g_sram, 1, g_sram_size, f);
     fclose(f);
+#ifdef __SWITCH__
+    fprintf(stderr, "[saves] wrote %s (%d bytes, hash=%08x)\n", path,
+            g_sram_size, snesrecomp_sram_hash());
+#endif
   } else {
     fprintf(stderr, "Unable to write %s\n", path);
   }

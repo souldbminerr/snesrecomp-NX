@@ -24,6 +24,14 @@
 
 #include <switch.h>
 
+#include "common_rtl.h"
+
+/* framedump.c is excluded from Switch builds (per-frame WRAM dumper for
+ * desktop forensics); common_rtl.c still reads this global, so provide
+ * the permanently-NULL instance here. No frames are ever dumped. */
+#include "framedump.h"
+FrameDumpCallback g_framedump_callback = 0;
+
 #ifndef SWITCH_APP_DIR
 #define SWITCH_APP_DIR "snesrecomp"
 #endif
@@ -41,6 +49,18 @@ __attribute__((weak)) void recomp_post_mortem_dump(const char *reason, void *inf
 
 const char *SwitchImpl_AppDir(void) {
   return SWITCH_APP_DIR;
+}
+
+/* SDL2's Switch keyboard driver (SDL_switchswkb.o, linked from portlibs)
+ * invokes this libnx applet helper from its per-frame pump. Our titles
+ * never use text input, so neutralize it at link time (--wrap,
+ * switch.mk) instead of modifying devkitPro's SDL: without the wrap,
+ * a stray pump with no keyboard session can enter applet code with
+ * garbage context. Unused libnx swkbd objects then drop out via
+ * --gc-sections. */
+void __wrap_swkbdInlineUpdate(void *ctx, int reply) {
+  (void)ctx;
+  (void)reply;
 }
 
 static void switch_mkdir_p(const char *path) {
@@ -61,6 +81,32 @@ static void switch_mkdir_p(const char *path) {
   mkdir(tmp, 0755);
 }
 
+static AppletHookCookie s_exit_hook;
+static AppletFocusState s_last_focus = AppletFocusState_InFocus;
+
+static void SwitchImpl_ExitHook(AppletHookType type, void *param) {
+  (void)param;
+  if (type == AppletHookType_OnExitRequest) {
+    fprintf(stderr, "[Switch] exit requested, persisting SRAM\n");
+    RtlWriteSram();
+    return;
+  }
+  if (type == AppletHookType_OnFocusState) {
+    /* Every dangerous quit path (Home Close, title takeover, sleep)
+     * passes through losing foreground first, while we can still run
+     * code. Save on the InFocus -> anything-else transition only, so a
+     * stuck state cannot spam writes. */
+    AppletFocusState now = appletGetFocusState();
+    if (now != AppletFocusState_InFocus &&
+        s_last_focus == AppletFocusState_InFocus) {
+      fprintf(stderr, "[Switch] focus lost (%d), persisting SRAM\n",
+              (int)now);
+      RtlWriteSram();
+    }
+    s_last_focus = now;
+  }
+}
+
 void SwitchImpl_Init(void) {
   static int s_inited = 0;
   char appdir[128];
@@ -69,6 +115,12 @@ void SwitchImpl_Init(void) {
   s_inited = 1;
 
   romfsInit();
+
+  /* Persist SRAM the moment the OS asks us to quit (Home menu Close,
+   * hbmenu unload): the main loop may never get another frame to run
+   * its own exit write. The hook fires on the same thread that pumps
+   * appletMainLoop, between emulated frames, so the image is stable. */
+  appletHook(&s_exit_hook, SwitchImpl_ExitHook, NULL);
 
   /* Land every relative path (config.ini, keybinds.ini, saves/, ROM
    * probe) on the SD card: sdmc:/switch/<app>/. */
@@ -109,6 +161,7 @@ void SwitchImpl_MaybeEnableFileLog(void) {
 }
 
 void SwitchImpl_Exit(void) {
+  appletUnhook(&s_exit_hook);
   romfsExit();
 }
 

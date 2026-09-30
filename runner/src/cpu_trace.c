@@ -1183,6 +1183,15 @@ void cpu_trace_block_watch_check(CpuState *cpu, uint32_t pc24) {
 }
 
 void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
+#ifdef __SWITCH__
+    /* Production handheld: no rings, watches, tripwires, env probes,
+     * or TCP consumers are ever armed (no init call, no server, no
+     * env), and nothing on Switch reads the forensic side effects.
+     * Skip the per-call bookkeeping entirely. */
+    (void)cpu;
+    (void)pc24;
+    return;
+#endif
     /* AOT block-charge probe (2026-08-31): env SNESRECOMP_AOTBLK="lo-hi"
      * (frame window). Logs pc24 + master_cycles at every AOT block entry so
      * the AOT charge per block can be diffed against the LLE per-block sums
@@ -1326,6 +1335,16 @@ static uint32_t fnv1a(const char *s) {
 }
 
 void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
+#ifdef __SWITCH__
+    /* Production handheld: no rings, watches, tripwires, env probes,
+     * or TCP consumers are ever armed (no init call, no server, no
+     * env), and nothing on Switch reads the forensic side effects.
+     * Skip the per-call bookkeeping entirely. */
+    (void)cpu;
+    (void)pc24;
+    (void)name;
+    return;
+#endif
     if (g_freeze_capture) return;  /* deliberate inspection-freeze */
     /* Investigation (env-gated): log DB/PB at every function entry inside a
      * frame window so a data-bank divergence can be located by chain.
@@ -1423,6 +1442,18 @@ void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) {
 
 void cpu_trace_event(CpuState *cpu, uint32_t pc24, uint8_t event_type,
                      uint8_t extra0, uint16_t extra1) {
+#ifdef __SWITCH__
+    /* Production handheld: no rings, watches, tripwires, env probes,
+     * or TCP consumers are ever armed (no init call, no server, no
+     * env), and nothing on Switch reads the forensic side effects.
+     * Skip the per-call bookkeeping entirely. */
+    (void)cpu;
+    (void)pc24;
+    (void)event_type;
+    (void)extra0;
+    (void)extra1;
+    return;
+#endif
     capture(cpu, pc24, event_type, extra0, extra1);
 }
 
@@ -1821,6 +1852,10 @@ uint8_t g_stack_op_trace_enabled = 1;
 void cpu_trace_stack_op(CpuState *cpu, uint32_t pc24, uint8_t op_id,
                         uint16_t old_S, int8_t delta) {
     if (!g_stack_op_trace_enabled) return;
+    /* The ring may legitimately be absent (headless/ROM-free runners and
+     * Switch builds never allocate it); capture() alone guards this, but
+     * the just-captured fixup below does not. */
+    if (!g_cpu_trace_ring || g_cpu_trace_capacity == 0) return;
     /* extra0 = op_id, extra1 = (uint16)((uint8)delta << 8) — sign-extended at
      * read time. Old S goes in addr16; new S in new_value (these are unused
      * for non-WRAM events, free to repurpose). */
@@ -1841,6 +1876,18 @@ static int db_watch_hit(uint8_t db) {
 
 void cpu_trace_db_change(CpuState *cpu, uint32_t pc24, uint8_t old_db,
                          uint8_t new_db, uint8_t event_type) {
+#ifdef __SWITCH__
+    /* Production handheld: no rings, watches, tripwires, env probes,
+     * or TCP consumers are ever armed (no init call, no server, no
+     * env), and nothing on Switch reads the forensic side effects.
+     * Skip the per-call bookkeeping entirely. */
+    (void)cpu;
+    (void)pc24;
+    (void)old_db;
+    (void)new_db;
+    (void)event_type;
+    return;
+#endif
     /* Investigation: windowed DB-WRITE log (same window as SNESRECOMP_DBTRACE).
      * Every DB change with its PC so the unfaithful write can be checked
      * against the ROM ASM (no oracle needed). */
@@ -1885,6 +1932,18 @@ void cpu_trace_db_change(CpuState *cpu, uint32_t pc24, uint8_t old_db,
 
 void cpu_trace_pb_change(CpuState *cpu, uint32_t pc24, uint8_t old_pb,
                          uint8_t new_pb, uint8_t event_type) {
+#ifdef __SWITCH__
+    /* Production handheld: no rings, watches, tripwires, env probes,
+     * or TCP consumers are ever armed (no init call, no server, no
+     * env), and nothing on Switch reads the forensic side effects.
+     * Skip the per-call bookkeeping entirely. */
+    (void)cpu;
+    (void)pc24;
+    (void)old_pb;
+    (void)new_pb;
+    (void)event_type;
+    return;
+#endif
     capture(cpu, pc24, event_type, old_pb, (uint16_t)new_pb);
     int slot = (int)(g_cpu_dbpb_idx++ & (CPU_DBPB_RING_LEN - 1));
     CpuDbpbEvent *d = &g_cpu_dbpb_ring[slot];

@@ -2419,6 +2419,18 @@ static int tier2_discover(uint32_t site, uint32_t target, uint8_t mx,
  * the target, so a crash cannot erase the address that caused it. */
 static void tier2_record(uint32_t site, uint32_t target, uint8_t mx,
                          uint8_t kind, int clean) {
+#ifdef __SWITCH__
+    /* Production handheld: the coverage table, RAM-routine
+     * snapshots, and JSONL journal feed desktop AOT burn-down
+     * tooling only. Nothing on Switch reads them, so skip the
+     * per-LLE-call bookkeeping entirely. */
+    (void)site;
+    (void)target;
+    (void)mx;
+    (void)kind;
+    (void)clean;
+    return;
+#endif
     int i = tier2_discover(site, target, mx, kind, clean ? 1 : 0);
     if (i < 0) return;
     if (clean) g_tier2_cov[i].clean_hits++;
@@ -2774,7 +2786,7 @@ static const char *tier2_kind_str(uint8_t k) {
     }
 }
 
-static int tier2_verbose(void) {
+static int __attribute__((unused)) tier2_verbose(void) {
     static int checked;
     static int verbose;
     if (!checked) {

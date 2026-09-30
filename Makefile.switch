@@ -66,6 +66,13 @@ GAME_CFILES	:=
 GAME_INCLUDES	:=	$(TOPDIR)/include
 # Extra game defines (e.g. -DMMX_GAME_NAME='"DKC2"').
 GAME_DEFS	:=
+# Production forensics: the make backend does not evaluate runner.cmake's
+# per-source options, whose defaults keep full diagnostic history on
+# (128 KiB WRAM hash + ring every frame, per-dispatch log, CGRAM/VRAM
+# scans + rings). Force them off like a CMake production build.
+GAME_DEFS	+=	-DSNESRECOMP_FRAME_FINGERPRINTS=0 \
+			-DSNESRECOMP_DISPATCH_HISTORY=0 \
+			-DSNESRECOMP_PPU_DMA_HISTORY=0
 
 # Optional: data files + RomFS content (baked-in dev assets; a test ROM
 # can ride here as romfs:/rom.sfc — the resolver probes it as fallback).
@@ -95,14 +102,20 @@ INCLUDE		:=	$(foreach dir,$(GAME_INCLUDES),-I$(dir)) \
 DEFINES		:=	$(SNESRECOMP_SWITCH_DEFS) $(GAME_DEFS) \
 			-DSWITCH_APP_DIR='"$(SWITCH_APP_DIR)"'
 
-CFLAGS		:=	-g -Wall -O2 -ffunction-sections \
-			$(ARCH) $(DEFINES) $(INCLUDE) `sdl2-config --cflags`
+CFLAGS := -Ofast -march=native -mtune=native \
+          -ffunction-sections -fdata-sections \
+          -Wall \
+          $(ARCH) $(DEFINES) $(INCLUDE) `sdl2-config --cflags`
 
 CXXFLAGS	:=	$(CFLAGS) -fno-rtti -fno-exceptions
 
 ASFLAGS		:=	-g $(ARCH)
 LDFLAGS		=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) \
 			-Wl,-Map,$(notdir $*.map)
+
+# GC sections so never-called entry points are dropped, plus the SDL
+# keyboard-pump neutralization (no text input in these titles).
+LDFLAGS		+=	-Wl,--gc-sections $(SNESRECOMP_SWITCH_WRAP)
 
 LIBS		:=	`sdl2-config --libs` -lm
 
