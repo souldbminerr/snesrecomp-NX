@@ -426,7 +426,6 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
     case 0x4219:
       return joypad_auto_read_reg(snes->input1_currentState, adr);
     case 0x421a:
-      return joypad_auto_read_reg(snes->input2_currentState, adr);
     case 0x421b:
       return joypad_auto_read_reg(snes->input2_currentState, adr);
     case 0x421c:

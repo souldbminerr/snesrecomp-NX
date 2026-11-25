@@ -318,7 +318,10 @@ void RtlReset(int mode) {
   // g_cpu); anchor the sync pointer to its current value so the first post-reset
   // catch-up sees a zero delta rather than the whole run's accumulated cycles.
   g_apu_last_sync_master = g_cpu.master_cycles;
+#ifndef __SWITCH__
+  /* mod_audio is desktop/dev-only and excluded from Switch builds. */
   snes_mod_audio_stop_all();
+#endif
   snes_reset(g_snes, true);
   g_snes->beamMasterLast = g_cpu.master_cycles;
   SnesEnterNativeMode();
@@ -703,7 +706,10 @@ bool RtlLoadSnapshot(const char *filename) {
     return false;
   }
   g_snes->beamMasterLast = g_cpu.master_cycles;
+#ifndef __SWITCH__
+  /* mod_audio is desktop/dev-only and excluded from Switch builds. */
   snes_mod_audio_stop_all();
+#endif
   PpuResetWidescreenOamHistory(g_snes->ppu);
   /* Post-load reconciliation: host-side execution state (fibers, HLE
    * scheduler bookkeeping) cannot live in the guest snapshot; give the
@@ -752,7 +758,10 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size) {
   RtlApuUnlock();
   if (memory.error) return false;
   g_snes->beamMasterLast = g_cpu.master_cycles;
+#ifndef __SWITCH__
+  /* mod_audio is desktop/dev-only and excluded from Switch builds. */
   snes_mod_audio_stop_all();
+#endif
   PpuResetWidescreenOamHistory(g_snes->ppu);
   if (g_rtl_game_info && g_rtl_game_info->on_state_loaded)
     g_rtl_game_info->on_state_loaded(hdr[1]);
@@ -1718,10 +1727,13 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
    * lock we already hold, which serialises it against MSU register
    * writes on the CPU thread (msu1_read/msu1_write take the same lock). */
   msu1_mix(audio_buffer, samples);
+#ifndef __SWITCH__
   /* Overlay follows the native+MSU mix and precedes recovery fade, so trusted
-   * one-shots share the final discontinuity smoothing. */
+   * one-shots share the final discontinuity smoothing. mod_audio is
+   * desktop/dev-only and excluded from Switch builds. */
   snes_mod_audio_mix(audio_buffer, samples,
                       (uint32_t)(RtlAudioOutputRate() + 0.5), channels);
+#endif
   for (int i = 0; i < samples && g_audio_recovery_remaining != 0; i++) {
     uint32_t progressed = RTL_AUDIO_RECOVERY_RAMP -
                           g_audio_recovery_remaining + 1;
