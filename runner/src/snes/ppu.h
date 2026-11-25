@@ -228,9 +228,24 @@ struct Ppu {
   // Clamp keeps a layer in the authentic 256 columns. Mirror/repeat render
   // the authentic scanline in isolation and use it to fill the side margins.
   uint8_t wsLayerClamp, wsLayerMirror, wsLayerRepeat;
+  // Repeat layers whose per-line period is measured from the rendered
+  // interior pixels (see PpuSetWidescreenLayerRepeatAutoPeriod). Bit L
+  // refers to BG(L+1).
+  uint8_t wsLayerRepeatAutoPeriod, wsLayerRepeatAutoEdgeRepair;
+  // Optional screen-space period for a repeated layer. Zero preserves the
+  // default 256-pixel native-frame repetition.
+  uint16_t wsLayerRepeatPeriod[4];
+  // Optional native-edge repair width for a proven periodic layer. Pixels in
+  // each edge band are sourced from the matching interior period.
+  uint8_t wsLayerRepeatEdgeRepair[4];
   // Optional scanline bands: clamp or cyclically repeat only [y0,y1).
   uint8_t wsClampY0[4], wsClampY1[4];
   uint8_t wsRepeatY0[4], wsRepeatY1[4];
+  // Optional scanline bands: the layer's own tilemap continues into the
+  // margins as the hardware wrap of its map (a static, fully authored
+  // 64-column plane). The world-keyed shadow is bypassed like a repeat band,
+  // and no padding merge replaces the rendered margins.
+  uint8_t wsRawY0[4], wsRawY1[4];
   // Optional scanline bands: scale a native-width layer across the full
   // widescreen budget. Used for full-screen liquid/effect planes.
   uint8_t wsStretchY0[4], wsStretchY1[4];
@@ -302,6 +317,9 @@ struct Ppu {
   // Host-only widescreen state; excluded from savestates and cleared by reset.
   PpuWidescreenLineEnhancer *widescreenLineEnhancer;
   void *widescreenLineEnhancerContext;
+  // Layers whose already-widened pixels remain eligible while a line
+  // enhancer is active. Zero preserves the legacy BG1-native-viewport clip.
+  uint8_t wsLineEnhancerWideLayers;
 
   // -- START OF SNAPSHOT, 0x10420 bytes
   uint16_t cgram[0x100];
@@ -379,6 +397,13 @@ static inline bool PpuWidescreenLayerRepeatBandActive(
       y >= ppu->wsRepeatY0[layer] && y < ppu->wsRepeatY1[layer];
 }
 
+static inline bool PpuWidescreenLayerRawBandActive(
+    const Ppu *ppu, unsigned int layer, int y) {
+  return layer < 4 &&
+      ppu->wsRawY1[layer] > ppu->wsRawY0[layer] &&
+      y >= ppu->wsRawY0[layer] && y < ppu->wsRawY1[layer];
+}
+
 static inline bool PpuWidescreenLayerStretchBandActive(
     const Ppu *ppu, unsigned int layer, int y) {
   return layer < 4 &&
@@ -395,20 +420,39 @@ static inline bool PpuWidescreenLineRepeatBandActive(const Ppu *ppu, int y) {
   return false;
 }
 
+// A presentation bias moves the authentic 4:3 viewport partly into the host
+// margin: bias > 0 places its first `bias` columns left of screen X=0, and
+// bias < 0 places its last columns right of X=255. A repeated layer renders
+// those columns from real VRAM, exactly as the unbiased frame would, so the
+// presented 4:3 region never depends on a repeat approximation.
+static inline int PpuWidescreenRepeatAuthenticExtra(const Ppu *ppu,
+                                                    bool right_side,
+                                                    int extra) {
+  int authentic = right_side ? -ppu->wsPresentationXBias
+                             : ppu->wsPresentationXBias;
+  if (authentic < 0)
+    authentic = 0;
+  return authentic < extra ? authentic : extra;
+}
+
 static inline int PpuWidescreenLayerExtra(
-    const Ppu *ppu, unsigned int layer, int y, int extra) {
+    const Ppu *ppu, unsigned int layer, int y, int extra, bool right_side) {
   if (layer < 4) {
-    if (ppu->wsLayerWidenMask &&
-        !(ppu->wsLayerWidenMask & (1u << layer)))
-      return 0;
-    if ((ppu->wsLayerClamp | ppu->wsLayerMirror | ppu->wsLayerRepeat) &
-        (1u << layer))
+    if ((ppu->wsLayerClamp | ppu->wsLayerMirror) & (1u << layer))
       return 0;
     if (ppu->wsClampY1[layer] > ppu->wsClampY0[layer] &&
         y >= ppu->wsClampY0[layer] && y < ppu->wsClampY1[layer])
       return 0;
-    if (PpuWidescreenLayerRepeatBandActive(ppu, layer, y) ||
-        PpuWidescreenLayerStretchBandActive(ppu, layer, y))
+    // A repeated layer is normally outside the widen mask (it is bounded),
+    // yet it must still render the authentic 4:3 columns that a
+    // presentation bias moved into the margin; decide that before the mask.
+    if ((ppu->wsLayerRepeat & (1u << layer)) ||
+        PpuWidescreenLayerRepeatBandActive(ppu, layer, y))
+      return PpuWidescreenRepeatAuthenticExtra(ppu, right_side, extra);
+    if (ppu->wsLayerWidenMask &&
+        !(ppu->wsLayerWidenMask & (1u << layer)))
+      return 0;
+    if (PpuWidescreenLayerStretchBandActive(ppu, layer, y))
       return 0;
   }
   if (layer != 2)
@@ -457,6 +501,11 @@ void PpuResetWidescreenOamHistory(Ppu *ppu);
 void PpuSetWidescreenLineEnhancer(Ppu *ppu,
                                   PpuWidescreenLineEnhancer *enhancer,
                                   void *context);
+
+// Keep selected physical/world-shadow layers visible in the side margins
+// while a line enhancer adjusts another screen buffer. The legacy default is
+// zero, which clips BG1 to the original viewport for enhancers that replace it.
+void PpuSetWidescreenLineEnhancerWideLayers(Ppu *ppu, uint8_t layer_mask);
 
 // Renderer-neutral host-overlay extraction (opt-in; see
 // docs/HOST_OVERLAY_EXTRACTION.md). Default behavior is unchanged: with no
@@ -609,6 +658,28 @@ void PpuSetWidescreenWindowExpansion(Ppu *ppu, uint8_t layer_mask,
 void PpuSetWidescreenLayerMirror(Ppu *ppu, uint8_t mask);
 void PpuSetWidescreenLayerRepeat(Ppu *ppu, uint8_t mask);
 
+// Use a proven screen-space period when continuing one repeated layer into
+// the margins. Zero selects the default 256-pixel native-frame period.
+void PpuSetWidescreenLayerRepeatPeriod(Ppu *ppu, uint8_t layer,
+                                       uint16_t period);
+
+// Replace this many pixels at each native edge from the layer's proven
+// interior period. Requires a nonzero repeat period for the same layer.
+// Measure each repeated line's horizontal period from its own rendered
+// interior pixels (x=7..248) and continue that period into the margins
+// instead of restarting the line every 256 pixels. Lines without a provable
+// period (at least two repetitions of a tile-aligned period up to 120 px)
+// keep the 256-pixel repeat. Layers in edge_repair_mask also rebuild their
+// seven endpoint pixels from the same period, which corrects the stale
+// fine-scroll columns of a bounded backdrop kept in a 64-column allocation;
+// omit a layer from that mask when its native edges are authentic content.
+// An explicit PpuSetWidescreenLayerRepeatPeriod takes precedence.
+void PpuSetWidescreenLayerRepeatAutoPeriod(Ppu *ppu, uint8_t period_mask,
+                                           uint8_t edge_repair_mask);
+
+void PpuSetWidescreenLayerRepeatEdgeRepair(Ppu *ppu, uint8_t layer,
+                                           uint8_t pixels);
+
 // Apply clamp, cyclic-repeat, or stretch only on scanlines [y0,y1).
 // y1<=y0 disables. Repeat/stretch bands apply to Mode-1 4bpp and 2bpp
 // background paths.
@@ -616,6 +687,12 @@ void PpuSetWidescreenLayerClampBand(Ppu *ppu, uint8_t layer, uint8_t y0,
                                     uint8_t y1);
 void PpuSetWidescreenLayerRepeatBand(Ppu *ppu, uint8_t layer, uint8_t y0,
                                      uint8_t y1);
+/* Present [y0,y1) of a layer from its own tilemap across the full host width:
+ * the map's hardware wrap serves the margins (a static, fully authored
+ * 64-column plane), the world-keyed shadow is bypassed, and no repeat merge
+ * runs. Cleared by PpuSetExtraSpace like the other bands. */
+void PpuSetWidescreenLayerRawBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                  uint8_t y1);
 void PpuSetWidescreenLayerStretchBand(Ppu *ppu, uint8_t layer, uint8_t y0,
                                       uint8_t y1);
 

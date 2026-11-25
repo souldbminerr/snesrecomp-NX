@@ -1,12 +1,13 @@
 #include "ws_shadow.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "ppu.h"
 
-enum { kLayers = 2 };
+/* BG1 and BG2 terrain owners plus a BG3 foreground layer (DKC2 ship-deck
+ * rigging). Games register only the layers they prove each frame. */
+enum { kLayers = 3 };
 
 enum {
   kWsWestKeep = 12, /* ~192px; gutter + wide platforms */
@@ -20,7 +21,6 @@ typedef struct WsShadowLayer {
   bool active;
   bool wide;
   bool fold;      /* periodic fold enabled (composes with world history) */
-  bool rawContinuation; /* unresolved margins use valid 64-column map data */
   bool worldSet;  /* WsShadowSetWorld called this frame */
   int dir;        /* last nonzero worldX motion: +1 right, -1 left */
   uint8_t tileShift; /* 3 = 8x8 map entries, 4 = 16x16 big tiles */
@@ -38,17 +38,6 @@ typedef struct WsShadowLayer {
    * (e.g. MMX room decompression racing the first widescreen frame);
    * captured entries are authoritative and never yield to a guess. */
   uint8_t *guessOrigin;
-  /* Exact decoder fill written through WsShadowForceTile. Authoritative for
-   * ownership, but distinct from a live VRAM capture in debug provenance. */
-  uint8_t *forceOrigin;
-  /* Generated cells that were actually served to the renderer — the set
-   * whose correctness the stream-retrodiction check can later prove or
-   * refute against the game's own native capture. */
-  uint8_t *served;
-  /* Optional per-cell last-writer attribution (SNESRECOMP_WS_WRITE_TRACE).
-   * frame stamps use snes_frame_counter; kind is WsShadowWriteKind. */
-  uint32_t *writerFrame;
-  uint8_t *writerKind;
   uint32_t validCount;
   int blankTilePlus1;
   uint32_t lastTx0;
@@ -64,19 +53,17 @@ typedef struct WsShadowLayer {
    * margin refill, or the object is erased outside the native window. */
   int respectGameWrites;
   bool rejectEastEcho;
+  /* Nonzero: this layer is a read-only view of s_layers[aliasPlus1 - 1]. */
+  int aliasPlus1;
+  /* Screen columns at each end of the PPU's 256-column window that are NOT
+   * backed by the cartridge's authentic VRAM window this frame. A host that
+   * presents the view shifted by a bias renders the last (or first) |bias|
+   * native columns from ring cells the cartridge never wrote for them; the
+   * world-keyed store serves those instead (WsShadowSetNativeViewportInset). */
+  uint8_t nativeInsetLeft;
+  uint8_t nativeInsetRight;
   uint16_t retainMapBase;
   bool haveRetainMapBase;
-  /* Scene-local cache window. The flat store is indexed by
-   * (worldTile - origin); origins follow the camera in aligned steps so
-   * DKC-style high absolute coordinates (bonus rooms parked deep in the
-   * 16-bit map) stay cacheable. Alignment is 512 world pixels in X and
-   * 256 in Y, which preserves the SNES 32x32-entry screen parity (and the
-   * wide layer's 512px half parity) across any rebase. retainHistory
-   * layers keep originTy pinned at 0: their Y keys are viewport rows. */
-  int64_t originTx;
-  int64_t originTy;
-  uint8_t originShift; /* tileShift the origins were computed in */
-  bool haveOrigin;
   uint8_t *cooldown;
   uint16_t prevLive[kWsLiveMaxCols * kWsLiveMaxRows];
   uint8_t prevLiveOcc[kWsLiveMaxCols * kWsLiveMaxRows];
@@ -104,472 +91,9 @@ static WsShadowLayer s_layers[kLayers];
 /* Always-on margin lookup accounting (see WsShadowTile). Never armed. */
 static WsShadowMarginStat s_marginStats[kLayers];
 
-/* Optional host-only provenance surface. Logical screen X is biased by the
- * PPU's compile-time margin capacity. This is deliberately outside Ppu and
- * WsShadowLayer so reset/saveload cannot make it guest-visible. */
-enum { kWsDebugProvenanceLines = 240 };
-static bool s_debugProvenanceEnabled;
-static uint8_t
-    s_debugProvenance[kLayers][kWsDebugProvenanceLines][kPpuBufWidth];
-
-enum {
-  kWsSnapshotMagic = 0x48535357u, /* "WSSH" */
-  kWsSnapshotVersion = 1,
-};
-
-typedef struct WsShadowSnapshotHeader {
-  uint32_t magic;
-  uint32_t version;
-  uint32_t totalSize;
-  uint32_t layerCount;
-  WsShadowMarginStat marginStats[kLayers];
-} WsShadowSnapshotHeader;
-
-typedef struct WsShadowLayerSnapshot {
-  uint32_t cellCount;
-  uint32_t flags;
-  int32_t dir;
-  uint32_t tileShift;
-  uint32_t worldX, worldY, scrollX, scrollY;
-  uint32_t mapBaseWord;
-  int32_t blankTilePlus1;
-  uint32_t lastTx0, lastTy0;
-  int32_t captureCols, westKeep, eastKeep, respectGameWrites;
-  uint32_t retainMapBase;
-  int64_t originTx, originTy;
-  uint32_t originShift;
-  int32_t prevLiveCols, prevLiveRows;
-  uint32_t prevLiveTx0, prevScrollY;
-  uint16_t prevLive[kWsLiveMaxCols * kWsLiveMaxRows];
-  uint8_t prevLiveOcc[kWsLiveMaxCols * kWsLiveMaxRows];
-} WsShadowLayerSnapshot;
-
-typedef struct WsShadowCellSnapshot {
-  uint32_t index;
-  uint16_t entry;
-  uint8_t flags; /* bit0 guess, bit1 force, bit2 served */
-  uint8_t cooldown;
-} WsShadowCellSnapshot;
-
-enum {
-  kWsLayerRegistered = 1u << 0,
-  kWsLayerActive = 1u << 1,
-  kWsLayerWide = 1u << 2,
-  kWsLayerFold = 1u << 3,
-  kWsLayerRawContinuation = 1u << 4,
-  kWsLayerWorldSet = 1u << 5,
-  kWsLayerHaveLastOrigin = 1u << 6,
-  kWsLayerRetainHistory = 1u << 7,
-  kWsLayerHaveRetainMapBase = 1u << 8,
-  kWsLayerRejectEastEcho = 1u << 9,
-  kWsLayerHaveOrigin = 1u << 10,
-  kWsLayerHavePrevLive = 1u << 11,
-};
-
-static bool EnsureLayerStorage(WsShadowLayer *layer) {
-  if (layer->entries)
-    return true;
-  const size_t count = (size_t)kWsShadowXTiles * kWsShadowYTiles;
-  layer->entries = (uint16_t *)calloc(count, sizeof(uint16_t));
-  layer->valid = (uint8_t *)calloc(count / 8, 1);
-  layer->guessOrigin = (uint8_t *)calloc(count / 8, 1);
-  layer->forceOrigin = (uint8_t *)calloc(count / 8, 1);
-  layer->served = (uint8_t *)calloc(count / 8, 1);
-  layer->cooldown = (uint8_t *)calloc(count, 1);
-  if (layer->entries && layer->valid && layer->guessOrigin &&
-      layer->forceOrigin && layer->served && layer->cooldown)
-    return true;
-  free(layer->entries);
-  free(layer->valid);
-  free(layer->guessOrigin);
-  free(layer->forceOrigin);
-  free(layer->served);
-  free(layer->cooldown);
-  layer->entries = NULL;
-  layer->valid = NULL;
-  layer->guessOrigin = NULL;
-  layer->forceOrigin = NULL;
-  layer->served = NULL;
-  layer->cooldown = NULL;
-  return false;
-}
-
-void WsShadowDebugSetProvenanceEnabled(bool enabled) {
-  s_debugProvenanceEnabled = enabled;
-  if (!enabled)
-    memset(s_debugProvenance, 0, sizeof s_debugProvenance);
-}
-
-bool WsShadowDebugProvenanceEnabled(void) {
-  return s_debugProvenanceEnabled;
-}
-
-void WsShadowDebugBeginFrame(void) {
-  if (s_debugProvenanceEnabled)
-    memset(s_debugProvenance, 0, sizeof s_debugProvenance);
-}
-
-uint8_t WsShadowDebugProvenanceAt(int layer, int screenX, int screenY) {
-  const int x = screenX + kPpuExtraLeftRight;
-  if (!s_debugProvenanceEnabled || layer < 0 || layer >= kLayers ||
-      screenY < 0 || screenY >= kWsDebugProvenanceLines ||
-      x < 0 || x >= kPpuBufWidth)
-    return kWsShadowProvenanceNone;
-  return s_debugProvenance[layer][screenY][x];
-}
-
-static void RecordDebugProvenance(int layer, int screenX, int screenY,
-                                  int pixelSpan, uint8_t source) {
-  if (!s_debugProvenanceEnabled || source == kWsShadowProvenanceNone ||
-      layer < 0 || layer >= kLayers || screenY < 0 ||
-      screenY >= kWsDebugProvenanceLines || pixelSpan <= 0)
-    return;
-  int x0 = screenX + kPpuExtraLeftRight;
-  int x1 = x0 + pixelSpan;
-  if (x0 < 0) x0 = 0;
-  if (x1 > kPpuBufWidth) x1 = kPpuBufWidth;
-  for (int x = x0; x < x1; x++)
-    s_debugProvenance[layer][screenY][x] = source;
-}
-
 static bool GetEntry(const WsShadowLayer *layer, uint32_t tx, uint32_t ty,
                      uint16_t *entry);
-static void SetEntry(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
-                     uint16_t entry);
-
-/* ---- scene-local cache window --------------------------------------- */
-
-extern int snes_frame_counter;
-
-/* Env-gated jsonl detail log for cache-bound events (out-of-range keys and
- * window rebases). Rate-limited per frame so a systematic failure cannot
- * flood the disk; the always-on stats counters carry the full totals. */
-static void CacheLog(int layerIndex, const WsShadowLayer *layer,
-                     const char *event, int64_t tx, int64_t ty) {
-  static FILE *file;
-  static int checked;
-  static int frame_seen = -1;
-  static int lines_this_frame;
-  if (!checked) {
-    checked = 1;
-    const char *path = getenv("SNESRECOMP_WS_CACHE_LOG");
-    if (path && path[0])
-      file = fopen(path, "wb");
-  }
-  if (!file)
-    return;
-  if (frame_seen != snes_frame_counter) {
-    frame_seen = snes_frame_counter;
-    lines_this_frame = 0;
-  }
-  if (lines_this_frame++ >= 64)
-    return;
-  fprintf(file,
-          "{\"frame\":%d,\"layer\":%d,\"event\":\"%s\",\"tile_x\":%lld,"
-          "\"tile_y\":%lld,\"origin_tx\":%lld,\"origin_ty\":%lld,"
-          "\"world_x\":%u,\"world_y\":%u,\"tile_shift\":%u}\n",
-          snes_frame_counter, layerIndex, event, (long long)tx, (long long)ty,
-          (long long)layer->originTx, (long long)layer->originTy,
-          layer->worldX, layer->worldY,
-          (unsigned)(layer->tileShift ? layer->tileShift : 3));
-  fflush(file);
-}
-
-static int LayerIndexOf(const WsShadowLayer *layer) {
-  return (int)(layer - s_layers);
-}
-
-static int WriteTraceArmed(void) {
-  static int armed = -1;
-  if (armed < 0) {
-    const char *setting = getenv("SNESRECOMP_WS_WRITE_TRACE");
-    armed = setting && setting[0] && setting[0] != '0';
-  }
-  return armed;
-}
-
-/* The write path that is currently storing entries; set by each public
- * entry point so the shared SetEntry funnel can attribute the cell. */
-static uint8_t s_currentWriteKind = kWsShadowWriteViewCapture;
-
-const char *WsShadowWriteKindName(int kind) {
-  switch (kind) {
-    case kWsShadowWriteViewCapture: return "view_capture";
-    case kWsShadowWriteUploadMirror: return "upload_mirror";
-    case kWsShadowWriteDecodeForce: return "decode_force";
-    case kWsShadowWritePrefillGuess: return "prefill_guess";
-    case kWsShadowWriteWestViewport: return "west_viewport";
-    case kWsShadowWriteBackfill: return "backfill";
-    default: return "none";
-  }
-}
-
-/* World tile -> store index space. False = outside the rebased window; the
- * caller decides whether that is routine (pruning past the edge) or an
- * accountable loss (a write or a margin serve). */
-static bool LocalTile(const WsShadowLayer *layer, uint32_t tx, uint32_t ty,
-                      uint32_t *ltx, uint32_t *lty) {
-  const int64_t lx = (int64_t)tx - layer->originTx;
-  const int64_t ly = (int64_t)ty - layer->originTy;
-  if (lx < 0 || lx >= kWsShadowXTiles || ly < 0 || ly >= kWsShadowYTiles)
-    return false;
-  *ltx = (uint32_t)lx;
-  *lty = (uint32_t)ly;
-  return true;
-}
-
-static void AccountOobWrite(WsShadowLayer *layer, uint32_t tx, uint32_t ty) {
-  const int li = LayerIndexOf(layer);
-  s_marginStats[li].outOfRangeWrite++;
-  CacheLog(li, layer, "oob_write", (int64_t)tx, (int64_t)ty);
-}
-
-/* Stream retrodiction: the game's own native capture is the oracle for
- * every generated margin entry that was actually shown. */
-static void RetrodictLog(int layerIndex, const WsShadowLayer *layer,
-                         uint32_t tx, uint32_t ty, uint16_t served_entry,
-                         uint16_t actual_entry) {
-  static FILE *file;
-  static int checked;
-  static int frame_seen = -1;
-  static int lines_this_frame;
-  if (!checked) {
-    checked = 1;
-    const char *path_text = getenv("SNESRECOMP_WS_RETRODICT");
-    if (path_text && path_text[0])
-      file = fopen(path_text, "wb");
-  }
-  if (!file)
-    return;
-  if (frame_seen != snes_frame_counter) {
-    frame_seen = snes_frame_counter;
-    lines_this_frame = 0;
-  }
-  if (lines_this_frame++ >= 64)
-    return;
-  fprintf(file,
-          "{\"frame\":%d,\"layer\":%d,\"tile_x\":%u,\"tile_y\":%u,"
-          "\"served\":%u,\"actual\":%u,\"world_x\":%u,\"world_y\":%u}\n",
-          snes_frame_counter, layerIndex, tx, ty, served_entry, actual_entry,
-          layer->worldX, layer->worldY);
-  fflush(file);
-}
-
-/* Capture write from the game's real VRAM (view sweep / upload mirror).
- * Before the truth lands, judge any generated-and-served prediction it
- * replaces: a differing value proves wrong art was shown in the margin. */
-static void SetEntryLive(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
-                         uint16_t entry) {
-  uint32_t ltx, lty;
-  if (layer->entries && layer->served &&
-      LocalTile(layer, tx, ty, &ltx, &lty)) {
-    const uint32_t i = lty * kWsShadowXTiles + ltx;
-    const uint8_t bit = (uint8_t)(1u << (i & 7));
-    if ((layer->served[i >> 3] & bit) &&
-        (layer->valid[i >> 3] & bit)) {
-      const int li = LayerIndexOf(layer);
-      s_marginStats[li].retrodictChecked++;
-      if (layer->entries[i] != entry) {
-        s_marginStats[li].retrodictMismatch++;
-        RetrodictLog(li, layer, tx, ty, layer->entries[i], entry);
-      }
-    }
-  }
-  SetEntry(layer, tx, ty, entry);
-}
-
-static void ClearAllStore(WsShadowLayer *layer) {
-  const size_t count = (size_t)kWsShadowXTiles * kWsShadowYTiles;
-  if (layer->valid)
-    memset(layer->valid, 0, count / 8);
-  if (layer->guessOrigin)
-    memset(layer->guessOrigin, 0, count / 8);
-  if (layer->forceOrigin)
-    memset(layer->forceOrigin, 0, count / 8);
-  if (layer->served)
-    memset(layer->served, 0, count / 8);
-  if (layer->cooldown)
-    memset(layer->cooldown, 0, count);
-  if (layer->writerFrame)
-    memset(layer->writerFrame, 0, count * sizeof(uint32_t));
-  if (layer->writerKind)
-    memset(layer->writerKind, 0, count);
-  layer->validCount = 0;
-}
-
-/* Move stored content so existing world keys stay addressable after the
- * origin steps to (newTx, newTy). Deltas are multiples of the 512px/256px
- * alignment, so bitmap shifts stay byte-aligned. Content that falls off
- * the window edge is dropped (it is beyond the retention span anyway). */
-static void RebaseStore(WsShadowLayer *layer, int64_t newTx, int64_t newTy) {
-  const int64_t dx = newTx - layer->originTx;
-  const int64_t dy = newTy - layer->originTy;
-  const int li = LayerIndexOf(layer);
-  s_marginStats[li].originRebase++;
-  CacheLog(li, layer, "rebase", newTx, newTy);
-  if (layer->writerFrame) {
-    /* Attribution is diagnostic; a rebase invalidates it rather than
-     * paying the shift cost. */
-    const size_t count = (size_t)kWsShadowXTiles * kWsShadowYTiles;
-    memset(layer->writerFrame, 0, count * sizeof(uint32_t));
-    memset(layer->writerKind, 0, count);
-  }
-  if (layer->entries) {
-    if (dx <= -kWsShadowXTiles || dx >= kWsShadowXTiles ||
-        dy <= -kWsShadowYTiles || dy >= kWsShadowYTiles) {
-      ClearAllStore(layer);
-    } else {
-      const int row_words = kWsShadowXTiles;
-      const int row_bits = kWsShadowXTiles / 8;
-      const int bx = (int)(dx >= 0 ? dx / 8 : -((-dx) / 8));
-      int ly0, ly1, step;
-      if (dy >= 0) {
-        ly0 = 0;
-        ly1 = kWsShadowYTiles;
-        step = 1;
-      } else {
-        ly0 = kWsShadowYTiles - 1;
-        ly1 = -1;
-        step = -1;
-      }
-      for (int ly = ly0; ly != ly1; ly += step) {
-        const int64_t sy = (int64_t)ly + dy;
-        uint16_t *entry_row = layer->entries + (size_t)ly * row_words;
-        uint8_t *valid_row = layer->valid + (size_t)ly * row_bits;
-        uint8_t *guess_row = layer->guessOrigin + (size_t)ly * row_bits;
-        uint8_t *force_row = layer->forceOrigin + (size_t)ly * row_bits;
-        uint8_t *served_row = layer->served + (size_t)ly * row_bits;
-        uint8_t *cool_row = layer->cooldown + (size_t)ly * row_words;
-        if (sy < 0 || sy >= kWsShadowYTiles) {
-          memset(entry_row, 0, (size_t)row_words * 2);
-          memset(valid_row, 0, (size_t)row_bits);
-          memset(guess_row, 0, (size_t)row_bits);
-          memset(force_row, 0, (size_t)row_bits);
-          memset(served_row, 0, (size_t)row_bits);
-          memset(cool_row, 0, (size_t)row_words);
-          continue;
-        }
-        const uint16_t *src_e = layer->entries + (size_t)sy * row_words;
-        const uint8_t *src_v = layer->valid + (size_t)sy * row_bits;
-        const uint8_t *src_g = layer->guessOrigin + (size_t)sy * row_bits;
-        const uint8_t *src_f = layer->forceOrigin + (size_t)sy * row_bits;
-        const uint8_t *src_s = layer->served + (size_t)sy * row_bits;
-        const uint8_t *src_c = layer->cooldown + (size_t)sy * row_words;
-        if (dx >= 0) {
-          const int keep = row_words - (int)dx;
-          const int keep_b = row_bits - bx;
-          memmove(entry_row, src_e + dx, (size_t)keep * 2);
-          memset(entry_row + keep, 0, (size_t)dx * 2);
-          memmove(cool_row, src_c + dx, (size_t)keep);
-          memset(cool_row + keep, 0, (size_t)dx);
-          memmove(valid_row, src_v + bx, (size_t)keep_b);
-          memset(valid_row + keep_b, 0, (size_t)bx);
-          memmove(guess_row, src_g + bx, (size_t)keep_b);
-          memset(guess_row + keep_b, 0, (size_t)bx);
-          memmove(force_row, src_f + bx, (size_t)keep_b);
-          memset(force_row + keep_b, 0, (size_t)bx);
-          memmove(served_row, src_s + bx, (size_t)keep_b);
-          memset(served_row + keep_b, 0, (size_t)bx);
-        } else {
-          const int shift = (int)-dx;
-          const int shift_b = -bx;
-          const int keep = row_words - shift;
-          const int keep_b = row_bits - shift_b;
-          memmove(entry_row + shift, src_e, (size_t)keep * 2);
-          memset(entry_row, 0, (size_t)shift * 2);
-          memmove(cool_row + shift, src_c, (size_t)keep);
-          memset(cool_row, 0, (size_t)shift);
-          memmove(valid_row + shift_b, src_v, (size_t)keep_b);
-          memset(valid_row, 0, (size_t)shift_b);
-          memmove(guess_row + shift_b, src_g, (size_t)keep_b);
-          memset(guess_row, 0, (size_t)shift_b);
-          memmove(force_row + shift_b, src_f, (size_t)keep_b);
-          memset(force_row, 0, (size_t)shift_b);
-          memmove(served_row + shift_b, src_s, (size_t)keep_b);
-          memset(served_row, 0, (size_t)shift_b);
-        }
-      }
-    }
-  }
-  layer->originTx = newTx;
-  layer->originTy = newTy;
-}
-
-/* Keep the camera's view tile comfortably inside the window; establish or
- * step the aligned origins when it drifts toward an edge. For worlds that
- * never leave the window (origin 0), this is the identity mapping and the
- * store behaves exactly as the pre-rebase engine. */
-static void EnsureOrigin(WsShadowLayer *layer) {
-  const unsigned sh = layer->tileShift ? layer->tileShift : 3;
-  const int64_t align_x = (int64_t)(512u >> sh);
-  const int64_t align_y = (int64_t)(256u >> sh);
-  const int64_t vx = (int64_t)(layer->worldX >> sh);
-  const int64_t vy = (int64_t)(layer->worldY >> sh);
-  const int64_t guard_x = kWsShadowXTiles / 8;
-  const int64_t guard_y = kWsShadowYTiles / 8;
-  bool stale = !layer->haveOrigin || layer->originShift != (uint8_t)sh;
-  if (!stale) {
-    const int64_t lx = vx - layer->originTx;
-    const int64_t ly = vy - layer->originTy;
-    const bool x_out = lx < guard_x || lx > kWsShadowXTiles - guard_x;
-    const bool y_out = !layer->retainHistory &&
-                       (ly < guard_y || ly > kWsShadowYTiles - guard_y);
-    if (!x_out && !y_out)
-      return;
-  }
-  int64_t want_tx = vx - kWsShadowXTiles / 2;
-  if (want_tx < 0)
-    want_tx = 0;
-  want_tx -= want_tx % align_x;
-  int64_t want_ty = 0;
-  if (!layer->retainHistory) {
-    want_ty = vy - kWsShadowYTiles / 2;
-    if (want_ty < 0)
-      want_ty = 0;
-    want_ty -= want_ty % align_y;
-  }
-  if (stale) {
-    /* Different tile size = different tile coordinate space entirely; any
-     * held content is unaddressable. Start the window clean. */
-    if (layer->haveOrigin && layer->entries)
-      ClearAllStore(layer);
-    layer->originTx = want_tx;
-    layer->originTy = want_ty;
-    layer->originShift = (uint8_t)sh;
-    layer->haveOrigin = true;
-    if (want_tx || want_ty)
-      CacheLog(LayerIndexOf(layer), layer, "origin_init", want_tx, want_ty);
-    return;
-  }
-  if (want_tx != layer->originTx || want_ty != layer->originTy)
-    RebaseStore(layer, want_tx, want_ty);
-}
-
-void WsShadowDebugOrigin(int layerIndex, long long *originTx,
-                         long long *originTy) {
-  const bool ok = layerIndex >= 0 && layerIndex < kLayers;
-  if (originTx)
-    *originTx = ok ? (long long)s_layers[layerIndex].originTx : 0;
-  if (originTy)
-    *originTy = ok ? (long long)s_layers[layerIndex].originTy : 0;
-}
-
-int WsShadowDebugLastWriter(int layerIndex, uint32_t worldTileX,
-                            uint32_t worldTileY, uint32_t *frame) {
-  if (layerIndex < 0 || layerIndex >= kLayers)
-    return kWsShadowWriteNone;
-  const WsShadowLayer *layer = &s_layers[layerIndex];
-  uint32_t ltx, lty;
-  if (!layer->writerFrame || !layer->writerKind ||
-      !LocalTile(layer, worldTileX, worldTileY, &ltx, &lty))
-    return kWsShadowWriteNone;
-  const uint32_t i = lty * kWsShadowXTiles + ltx;
-  if (!layer->writerKind[i])
-    return kWsShadowWriteNone;
-  if (frame)
-    *frame = layer->writerFrame[i];
-  return layer->writerKind[i];
-}
+static WsShadowLayer *EntryStore(WsShadowLayer *layer);
 
 void WsShadowGetMarginStats(int layerIndex, WsShadowMarginStat *out) {
   if (!out)
@@ -586,100 +110,51 @@ bool WsShadowLookupWorldTile(int layerIndex, uint32_t worldTileX,
                              uint32_t worldTileY, uint16_t *entry) {
   if (!entry || layerIndex < 0 || layerIndex >= kLayers)
     return false;
-  return GetEntry(&s_layers[layerIndex], worldTileX, worldTileY, entry);
+  return GetEntry(EntryStore(&s_layers[layerIndex]), worldTileX, worldTileY,
+                  entry);
+}
+
+static bool InBounds(uint32_t tx, uint32_t ty) {
+  return tx < kWsShadowXTiles && ty < kWsShadowYTiles;
 }
 
 static void SetEntry(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
                      uint16_t entry) {
-  uint32_t ltx, lty;
-  if (!layer->entries)
+  if (!layer->entries || !InBounds(tx, ty))
     return;
-  if (!LocalTile(layer, tx, ty, &ltx, &lty)) {
-    AccountOobWrite(layer, tx, ty);
-    return;
-  }
-  uint32_t i = lty * kWsShadowXTiles + ltx;
+  uint32_t i = ty * kWsShadowXTiles + tx;
   layer->entries[i] = entry;
   layer->valid[i >> 3] |= (uint8_t)(1u << (i & 7));
   /* Every non-prefill write is a capture (or an exact Force): it wins over
    * any future prefill guess for this cell. */
   if (layer->guessOrigin)
     layer->guessOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
-  if (layer->forceOrigin)
-    layer->forceOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
-  if (layer->served)
-    layer->served[i >> 3] &= (uint8_t)~(1u << (i & 7));
-  if (WriteTraceArmed()) {
-    if (!layer->writerFrame) {
-      const size_t count = (size_t)kWsShadowXTiles * kWsShadowYTiles;
-      layer->writerFrame = (uint32_t *)calloc(count, sizeof(uint32_t));
-      layer->writerKind = (uint8_t *)calloc(count, 1);
-    }
-    if (layer->writerFrame && layer->writerKind) {
-      layer->writerFrame[i] = (uint32_t)snes_frame_counter;
-      layer->writerKind[i] = s_currentWriteKind;
-    }
-  }
 }
 
 static void SetEntryGuess(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
                           uint16_t entry) {
-  uint32_t ltx, lty;
-  if (!layer->entries)
+  if (!layer->entries || !InBounds(tx, ty))
     return;
-  if (!LocalTile(layer, tx, ty, &ltx, &lty)) {
-    AccountOobWrite(layer, tx, ty);
-    return;
-  }
-  uint32_t i = lty * kWsShadowXTiles + ltx;
+  uint32_t i = ty * kWsShadowXTiles + tx;
   layer->entries[i] = entry;
   layer->valid[i >> 3] |= (uint8_t)(1u << (i & 7));
   if (layer->guessOrigin)
     layer->guessOrigin[i >> 3] |= (uint8_t)(1u << (i & 7));
-  if (layer->forceOrigin)
-    layer->forceOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
-  if (layer->served)
-    layer->served[i >> 3] &= (uint8_t)~(1u << (i & 7));
-  if (WriteTraceArmed() && layer->writerFrame && layer->writerKind) {
-    layer->writerFrame[i] = (uint32_t)snes_frame_counter;
-    layer->writerKind[i] = kWsShadowWritePrefillGuess;
-  }
-}
-
-static void SetEntryForced(WsShadowLayer *layer, uint32_t tx, uint32_t ty,
-                           uint16_t entry) {
-  uint32_t ltx, lty;
-  SetEntry(layer, tx, ty, entry);
-  if (!layer->forceOrigin || !LocalTile(layer, tx, ty, &ltx, &lty))
-    return;
-  uint32_t i = lty * kWsShadowXTiles + ltx;
-  layer->forceOrigin[i >> 3] |= (uint8_t)(1u << (i & 7));
 }
 
 static bool IsGuessOrigin(const WsShadowLayer *layer, uint32_t tx,
                           uint32_t ty) {
-  uint32_t ltx, lty;
-  if (!layer->guessOrigin || !LocalTile(layer, tx, ty, &ltx, &lty))
+  if (!layer->guessOrigin || !InBounds(tx, ty))
     return false;
-  uint32_t i = lty * kWsShadowXTiles + ltx;
+  uint32_t i = ty * kWsShadowXTiles + tx;
   return (layer->guessOrigin[i >> 3] & (1u << (i & 7))) != 0;
-}
-
-static bool IsForceOrigin(const WsShadowLayer *layer, uint32_t tx,
-                          uint32_t ty) {
-  uint32_t ltx, lty;
-  if (!layer->forceOrigin || !LocalTile(layer, tx, ty, &ltx, &lty))
-    return false;
-  uint32_t i = lty * kWsShadowXTiles + ltx;
-  return (layer->forceOrigin[i >> 3] & (1u << (i & 7))) != 0;
 }
 
 static bool GetEntry(const WsShadowLayer *layer, uint32_t tx, uint32_t ty,
                      uint16_t *entry) {
-  uint32_t ltx, lty;
-  if (!layer->entries || !LocalTile(layer, tx, ty, &ltx, &lty))
+  if (!layer->entries || !InBounds(tx, ty))
     return false;
-  uint32_t i = lty * kWsShadowXTiles + ltx;
+  uint32_t i = ty * kWsShadowXTiles + tx;
   if (!(layer->valid[i >> 3] & (1u << (i & 7))))
     return false;
   *entry = layer->entries[i];
@@ -687,18 +162,18 @@ static bool GetEntry(const WsShadowLayer *layer, uint32_t tx, uint32_t ty,
 }
 
 static void ClearEntry(WsShadowLayer *layer, uint32_t tx, uint32_t ty) {
-  uint32_t ltx, lty;
-  /* Out-of-window clears are routine (pruning sweeps past the edges). */
-  if (!layer->valid || !LocalTile(layer, tx, ty, &ltx, &lty))
+  if (!layer->valid || !InBounds(tx, ty))
     return;
-  uint32_t i = lty * kWsShadowXTiles + ltx;
+  uint32_t i = ty * kWsShadowXTiles + tx;
   layer->valid[i >> 3] &= (uint8_t)~(1u << (i & 7));
-  if (layer->guessOrigin)
-    layer->guessOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
-  if (layer->forceOrigin)
-    layer->forceOrigin[i >> 3] &= (uint8_t)~(1u << (i & 7));
-  if (layer->served)
-    layer->served[i >> 3] &= (uint8_t)~(1u << (i & 7));
+}
+
+/* The layer whose entries serve a lookup: the layer itself, or the owner it
+ * was registered as a view of. Keys (world/scroll) always stay per layer. */
+static WsShadowLayer *EntryStore(WsShadowLayer *layer) {
+  if (layer->aliasPlus1 > 0 && layer->aliasPlus1 <= kLayers)
+    return &s_layers[layer->aliasPlus1 - 1];
+  return layer;
 }
 
 static bool IsLiveOpaque(uint16_t tile) {
@@ -712,254 +187,21 @@ void WsShadowReset(void) {
       memset(layer->valid, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
     if (layer->guessOrigin)
       memset(layer->guessOrigin, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
-    if (layer->forceOrigin)
-      memset(layer->forceOrigin, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
-    if (layer->served)
-      memset(layer->served, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
     if (layer->cooldown)
       memset(layer->cooldown, 0, (size_t)kWsShadowXTiles * kWsShadowYTiles);
     layer->validCount = 0;
     layer->registered = false;
     layer->active = false;
     layer->fold = false;
-    layer->rawContinuation = false;
+    layer->aliasPlus1 = 0;
     layer->worldSet = false;
     layer->haveLastOrigin = false;
     layer->haveRetainMapBase = false;
-    layer->haveOrigin = false;
-    layer->originTx = 0;
-    layer->originTy = 0;
-    layer->originShift = 0;
     layer->havePrevLive = false;
     layer->prevLiveCols = 0;
     layer->prevLiveRows = 0;
     memset(layer->foldRow, 0, sizeof(layer->foldRow));
   }
-}
-
-static uint32_t SnapshotCellCount(const WsShadowLayer *layer) {
-  if (!layer->valid)
-    return 0;
-  const size_t bytes =
-      (size_t)kWsShadowXTiles * kWsShadowYTiles / 8;
-  uint32_t count = 0;
-  for (size_t i = 0; i < bytes; i++) {
-    uint8_t bits = layer->valid[i];
-    while (bits) {
-      bits &= (uint8_t)(bits - 1u);
-      count++;
-    }
-  }
-  return count;
-}
-
-static uint32_t SnapshotLayerFlags(const WsShadowLayer *layer) {
-  return (layer->registered ? kWsLayerRegistered : 0u) |
-      (layer->active ? kWsLayerActive : 0u) |
-      (layer->wide ? kWsLayerWide : 0u) |
-      (layer->fold ? kWsLayerFold : 0u) |
-      (layer->rawContinuation ? kWsLayerRawContinuation : 0u) |
-      (layer->worldSet ? kWsLayerWorldSet : 0u) |
-      (layer->haveLastOrigin ? kWsLayerHaveLastOrigin : 0u) |
-      (layer->retainHistory ? kWsLayerRetainHistory : 0u) |
-      (layer->haveRetainMapBase ? kWsLayerHaveRetainMapBase : 0u) |
-      (layer->rejectEastEcho ? kWsLayerRejectEastEcho : 0u) |
-      (layer->haveOrigin ? kWsLayerHaveOrigin : 0u) |
-      (layer->havePrevLive ? kWsLayerHavePrevLive : 0u);
-}
-
-size_t WsShadowSnapshotSize(void) {
-  size_t size = sizeof(WsShadowSnapshotHeader);
-  for (int i = 0; i < kLayers; i++) {
-    const uint32_t cells = SnapshotCellCount(&s_layers[i]);
-    if (cells > (SIZE_MAX - size - sizeof(WsShadowLayerSnapshot)) /
-                    sizeof(WsShadowCellSnapshot))
-      return 0;
-    size += sizeof(WsShadowLayerSnapshot) +
-            (size_t)cells * sizeof(WsShadowCellSnapshot);
-  }
-  return size;
-}
-
-bool WsShadowSnapshotSave(void *data, size_t size) {
-  const size_t needed = WsShadowSnapshotSize();
-  if (!data || !needed || size < needed || needed > UINT32_MAX)
-    return false;
-  uint8_t *cursor = (uint8_t *)data;
-  WsShadowSnapshotHeader header;
-  memset(&header, 0, sizeof header);
-  header.magic = kWsSnapshotMagic;
-  header.version = kWsSnapshotVersion;
-  header.totalSize = (uint32_t)needed;
-  header.layerCount = kLayers;
-  memcpy(header.marginStats, s_marginStats, sizeof header.marginStats);
-  memcpy(cursor, &header, sizeof header);
-  cursor += sizeof header;
-
-  const uint32_t capacity = kWsShadowXTiles * kWsShadowYTiles;
-  for (int li = 0; li < kLayers; li++) {
-    const WsShadowLayer *layer = &s_layers[li];
-    WsShadowLayerSnapshot state;
-    memset(&state, 0, sizeof state);
-    state.cellCount = SnapshotCellCount(layer);
-    state.flags = SnapshotLayerFlags(layer);
-    state.dir = layer->dir;
-    state.tileShift = layer->tileShift;
-    state.worldX = layer->worldX;
-    state.worldY = layer->worldY;
-    state.scrollX = layer->scrollX;
-    state.scrollY = layer->scrollY;
-    state.mapBaseWord = layer->mapBaseWord;
-    state.blankTilePlus1 = layer->blankTilePlus1;
-    state.lastTx0 = layer->lastTx0;
-    state.lastTy0 = layer->lastTy0;
-    state.captureCols = layer->captureCols;
-    state.westKeep = layer->westKeep;
-    state.eastKeep = layer->eastKeep;
-    state.respectGameWrites = layer->respectGameWrites;
-    state.retainMapBase = layer->retainMapBase;
-    state.originTx = layer->originTx;
-    state.originTy = layer->originTy;
-    state.originShift = layer->originShift;
-    state.prevLiveCols = layer->prevLiveCols;
-    state.prevLiveRows = layer->prevLiveRows;
-    state.prevLiveTx0 = layer->prevLiveTx0;
-    state.prevScrollY = layer->prevScrollY;
-    memcpy(state.prevLive, layer->prevLive, sizeof state.prevLive);
-    memcpy(state.prevLiveOcc, layer->prevLiveOcc, sizeof state.prevLiveOcc);
-    memcpy(cursor, &state, sizeof state);
-    cursor += sizeof state;
-
-    if (!layer->valid)
-      continue;
-    for (uint32_t index = 0; index < capacity; index++) {
-      const uint8_t bit = (uint8_t)(1u << (index & 7));
-      if (!(layer->valid[index >> 3] & bit))
-        continue;
-      WsShadowCellSnapshot cell;
-      cell.index = index;
-      cell.entry = layer->entries[index];
-      cell.flags =
-          (layer->guessOrigin[index >> 3] & bit ? 1u : 0u) |
-          (layer->forceOrigin[index >> 3] & bit ? 2u : 0u) |
-          (layer->served[index >> 3] & bit ? 4u : 0u);
-      cell.cooldown = layer->cooldown[index];
-      memcpy(cursor, &cell, sizeof cell);
-      cursor += sizeof cell;
-    }
-  }
-  return (size_t)(cursor - (uint8_t *)data) == needed;
-}
-
-static void RestoreLayerState(WsShadowLayer *layer,
-                              const WsShadowLayerSnapshot *state) {
-  const uint32_t flags = state->flags;
-  layer->registered = (flags & kWsLayerRegistered) != 0;
-  layer->active = (flags & kWsLayerActive) != 0;
-  layer->wide = (flags & kWsLayerWide) != 0;
-  layer->fold = (flags & kWsLayerFold) != 0;
-  layer->rawContinuation = (flags & kWsLayerRawContinuation) != 0;
-  layer->worldSet = (flags & kWsLayerWorldSet) != 0;
-  layer->haveLastOrigin = (flags & kWsLayerHaveLastOrigin) != 0;
-  layer->retainHistory = (flags & kWsLayerRetainHistory) != 0;
-  layer->haveRetainMapBase = (flags & kWsLayerHaveRetainMapBase) != 0;
-  layer->rejectEastEcho = (flags & kWsLayerRejectEastEcho) != 0;
-  layer->haveOrigin = (flags & kWsLayerHaveOrigin) != 0;
-  layer->havePrevLive = (flags & kWsLayerHavePrevLive) != 0;
-  layer->dir = state->dir;
-  layer->tileShift = (uint8_t)state->tileShift;
-  layer->worldX = state->worldX;
-  layer->worldY = state->worldY;
-  layer->scrollX = state->scrollX;
-  layer->scrollY = state->scrollY;
-  layer->mapBaseWord = (uint16_t)state->mapBaseWord;
-  layer->blankTilePlus1 = state->blankTilePlus1;
-  layer->lastTx0 = state->lastTx0;
-  layer->lastTy0 = state->lastTy0;
-  layer->captureCols = state->captureCols;
-  layer->westKeep = state->westKeep;
-  layer->eastKeep = state->eastKeep;
-  layer->respectGameWrites = state->respectGameWrites;
-  layer->retainMapBase = (uint16_t)state->retainMapBase;
-  layer->originTx = state->originTx;
-  layer->originTy = state->originTy;
-  layer->originShift = (uint8_t)state->originShift;
-  layer->prevLiveCols = state->prevLiveCols;
-  layer->prevLiveRows = state->prevLiveRows;
-  layer->prevLiveTx0 = state->prevLiveTx0;
-  layer->prevScrollY = state->prevScrollY;
-  memcpy(layer->prevLive, state->prevLive, sizeof layer->prevLive);
-  memcpy(layer->prevLiveOcc, state->prevLiveOcc, sizeof layer->prevLiveOcc);
-  layer->foldVram = NULL;
-  memset(layer->foldRow, 0, sizeof layer->foldRow);
-}
-
-bool WsShadowSnapshotLoad(const void *data, size_t size) {
-  if (!data || size < sizeof(WsShadowSnapshotHeader))
-    return false;
-  WsShadowSnapshotHeader header;
-  memcpy(&header, data, sizeof header);
-  if (header.magic != kWsSnapshotMagic ||
-      header.version != kWsSnapshotVersion ||
-      header.layerCount != kLayers || header.totalSize != size)
-    return false;
-
-  /* Validate the entire variable-length stream before mutating live state. */
-  const uint8_t *cursor = (const uint8_t *)data + sizeof header;
-  const uint8_t *end = (const uint8_t *)data + size;
-  const uint32_t capacity = kWsShadowXTiles * kWsShadowYTiles;
-  for (int li = 0; li < kLayers; li++) {
-    if ((size_t)(end - cursor) < sizeof(WsShadowLayerSnapshot))
-      return false;
-    WsShadowLayerSnapshot state;
-    memcpy(&state, cursor, sizeof state);
-    cursor += sizeof state;
-    if (state.cellCount > capacity ||
-        state.tileShift > 4 || state.originShift > 4 ||
-        state.prevLiveCols < 0 || state.prevLiveCols > kWsLiveMaxCols ||
-        state.prevLiveRows < 0 || state.prevLiveRows > kWsLiveMaxRows ||
-        (size_t)(end - cursor) <
-            (size_t)state.cellCount * sizeof(WsShadowCellSnapshot))
-      return false;
-    for (uint32_t i = 0; i < state.cellCount; i++) {
-      WsShadowCellSnapshot cell;
-      memcpy(&cell, cursor + (size_t)i * sizeof cell, sizeof cell);
-      if (cell.index >= capacity || (cell.flags & ~7u))
-        return false;
-    }
-    cursor += (size_t)state.cellCount * sizeof(WsShadowCellSnapshot);
-  }
-  if (cursor != end)
-    return false;
-
-  WsShadowReset();
-  memcpy(s_marginStats, header.marginStats, sizeof s_marginStats);
-  cursor = (const uint8_t *)data + sizeof header;
-  for (int li = 0; li < kLayers; li++) {
-    WsShadowLayerSnapshot state;
-    memcpy(&state, cursor, sizeof state);
-    cursor += sizeof state;
-    WsShadowLayer *layer = &s_layers[li];
-    if ((state.cellCount || state.flags) && !EnsureLayerStorage(layer)) {
-      WsShadowReset();
-      return false;
-    }
-    RestoreLayerState(layer, &state);
-    layer->validCount = state.cellCount;
-    for (uint32_t i = 0; i < state.cellCount; i++) {
-      WsShadowCellSnapshot cell;
-      memcpy(&cell, cursor, sizeof cell);
-      cursor += sizeof cell;
-      const uint8_t bit = (uint8_t)(1u << (cell.index & 7));
-      layer->entries[cell.index] = cell.entry;
-      layer->valid[cell.index >> 3] |= bit;
-      if (cell.flags & 1u) layer->guessOrigin[cell.index >> 3] |= bit;
-      if (cell.flags & 2u) layer->forceOrigin[cell.index >> 3] |= bit;
-      if (cell.flags & 4u) layer->served[cell.index >> 3] |= bit;
-      layer->cooldown[cell.index] = cell.cooldown;
-    }
-  }
-  return true;
 }
 
 void WsShadowSetPeriodicFold(int layerIndex) {
@@ -973,22 +215,33 @@ void WsShadowSetPeriodicFold(int layerIndex) {
    * through to the world-keyed history, then to the plain map wrap. */
 }
 
-void WsShadowSetRawContinuation(int layerIndex, bool enabled) {
-  if (layerIndex < 0 || layerIndex >= kLayers)
-    return;
-  s_layers[layerIndex].rawContinuation = enabled;
-}
-
 void WsShadowSetWorld(int layerIndex, uint32_t worldX, uint32_t worldY) {
   if (layerIndex < 0 || layerIndex >= kLayers)
     return;
   WsShadowLayer *layer = &s_layers[layerIndex];
-  if (!EnsureLayerStorage(layer))
-    return;
+  if (!layer->entries) {
+    size_t count = (size_t)kWsShadowXTiles * kWsShadowYTiles;
+    layer->entries = (uint16_t *)calloc(count, sizeof(uint16_t));
+    layer->valid = (uint8_t *)calloc(count / 8, 1);
+    layer->guessOrigin = (uint8_t *)calloc(count / 8, 1);
+    layer->cooldown = (uint8_t *)calloc(count, 1);
+    if (!layer->entries || !layer->valid || !layer->guessOrigin ||
+        !layer->cooldown) {
+      free(layer->entries);
+      free(layer->valid);
+      free(layer->guessOrigin);
+      free(layer->cooldown);
+      memset(layer, 0, sizeof(*layer));
+      return;
+    }
+  }
   layer->registered = true;
   layer->worldSet = true;
+  layer->aliasPlus1 = 0;
   if (worldX != layer->worldX)
     layer->dir = ((int32_t)(worldX - layer->worldX) > 0) ? 1 : -1;
+  layer->nativeInsetLeft = 0;
+  layer->nativeInsetRight = 0;
   layer->worldX = worldX;
   layer->worldY = worldY;
   layer->scrollX = worldX;
@@ -1001,6 +254,61 @@ void WsShadowSetScroll(int layerIndex, uint32_t scrollX, uint32_t scrollY) {
   WsShadowLayer *layer = &s_layers[layerIndex];
   layer->scrollX = scrollX;
   layer->scrollY = scrollY;
+}
+
+void WsShadowSetNativeViewportInset(int layerIndex, int leftPixels,
+                                    int rightPixels) {
+  if (layerIndex < 0 || layerIndex >= kLayers)
+    return;
+  if (leftPixels < 0) leftPixels = 0;
+  if (rightPixels < 0) rightPixels = 0;
+  if (leftPixels > 255) leftPixels = 255;
+  if (rightPixels > 255) rightPixels = 255;
+  WsShadowLayer *layer = &s_layers[layerIndex];
+  layer->nativeInsetLeft = (uint8_t)leftPixels;
+  layer->nativeInsetRight = (uint8_t)rightPixels;
+}
+
+int WsShadowNativeLeft(int layerIndex) {
+  if (layerIndex < 0 || layerIndex >= kLayers ||
+      !s_layers[layerIndex].active)
+    return 0;
+  return s_layers[layerIndex].nativeInsetLeft;
+}
+
+int WsShadowNativeRight(int layerIndex) {
+  if (layerIndex < 0 || layerIndex >= kLayers ||
+      !s_layers[layerIndex].active)
+    return 256;
+  return 256 - s_layers[layerIndex].nativeInsetRight;
+}
+
+void WsShadowSetEntryAlias(int layerIndex, int sourceLayer, uint32_t worldX,
+                           uint32_t worldY, uint32_t scrollX,
+                           uint32_t scrollY) {
+  if (layerIndex < 0 || layerIndex >= kLayers)
+    return;
+  WsShadowLayer *layer = &s_layers[layerIndex];
+  if (sourceLayer < 0 || sourceLayer >= kLayers || sourceLayer == layerIndex) {
+    layer->aliasPlus1 = 0;
+    return;
+  }
+  layer->aliasPlus1 = sourceLayer + 1;
+  layer->nativeInsetLeft = 0;
+  layer->nativeInsetRight = 0;
+  layer->registered = true;
+  layer->worldSet = true;
+  layer->fold = false;
+  layer->worldX = worldX;
+  layer->worldY = worldY;
+  layer->scrollX = scrollX;
+  layer->scrollY = scrollY;
+}
+
+void WsShadowClearEntryAlias(int layerIndex) {
+  if (layerIndex < 0 || layerIndex >= kLayers)
+    return;
+  s_layers[layerIndex].aliasPlus1 = 0;
 }
 
 /* World y-tile for a map row, using the anchor's 32-row wrap window. */
@@ -1017,10 +325,21 @@ static uint32_t WorldRowForMapRow(const WsShadowLayer *layer, int row) {
  * being staged ahead (or behind, per the last travel direction). This
  * feeds freshly staged content - including first-visit world-anchored
  * features - into the history the moment it exists in VRAM. */
+static uint32_t s_pageWriteFrame[32];
+
+uint32_t WsShadowVramPageWriteFrame(unsigned page) {
+  return page < 32u ? s_pageWriteFrame[page] : 0u;
+}
+
 void WsShadowOnVramWrite(uint16_t wordAdr, uint16_t value) {
+  {
+    extern int snes_frame_counter;
+    s_pageWriteFrame[(wordAdr >> 10) & 31u] =
+        (uint32_t)snes_frame_counter + 1u;
+  }
   for (int i = 0; i < kLayers; i++) {
     WsShadowLayer *layer = &s_layers[i];
-    if (!layer->active || !layer->entries)
+    if (!layer->active || !layer->entries || layer->aliasPlus1)
       continue;
     uint16_t off = (uint16_t)(wordAdr - layer->mapBaseWord);
     if (off >= (layer->wide ? 0x800 : 0x400))
@@ -1035,27 +354,17 @@ void WsShadowOnVramWrite(uint16_t wordAdr, uint16_t value) {
       chunk = k0;
     else if ((uint32_t)(col >> 5) == (k0 & 1))
       chunk = k0;
-    else if (layer->dir < 0 && k0 > 0)
-      chunk = k0 - 1;
     else
-      /* Staging "behind" chunk 0 does not exist; a mismatched half at the
-       * world's west edge can only be the chunk ahead. A stale leftward
-       * dir from the previous scene otherwise attributes level-entry
-       * uploads to chunk -1 and the capture is lost (surfaced by the
-       * scene-local window's out-of-range write accounting). */
-      chunk = k0 + 1;
+      chunk = layer->dir < 0 ? k0 - 1 : k0 + 1;
     uint32_t tx = chunk * 32 + (uint32_t)(col & 31);
     uint32_t ty = WorldRowForMapRow(layer, row);
-    s_currentWriteKind = kWsShadowWriteUploadMirror;
-    SetEntryLive(layer, tx, ty, value);
-    s_currentWriteKind = kWsShadowWriteViewCapture;
+    SetEntry(layer, tx, ty, value);
     /* Frame-stamp the game's own write so a respectGameWrites margin
      * refill yields to it (dynamic BG objects: platforms, elevators). */
-    if (layer->respectGameWrites && layer->cooldown) {
-      uint32_t ltx, lty;
-      if (LocalTile(layer, tx, ty, &ltx, &lty))
-        layer->cooldown[lty * kWsShadowXTiles + ltx] =
-            (uint8_t)(snes_frame_counter & 0xFF);
+    if (layer->respectGameWrites && layer->cooldown && InBounds(tx, ty)) {
+      extern int snes_frame_counter;
+      layer->cooldown[ty * kWsShadowXTiles + tx] =
+          (uint8_t)(snes_frame_counter & 0xFF);
     }
   }
 }
@@ -1122,11 +431,11 @@ void WsShadowPrefillTile(int layerIndex, uint32_t worldTileX,
                          uint32_t worldTileY, uint16_t entry) {
   if (layerIndex < 0 || layerIndex >= kLayers)
     return;
-  WsShadowLayer *layer = &s_layers[layerIndex];
+  WsShadowLayer *view = &s_layers[layerIndex];
+  WsShadowLayer *layer = EntryStore(view);
   if (layer->retainHistory)
     return;
-  if (layer->entries && (layer->active || layer->registered)) {
-    EnsureOrigin(layer);
+  if (layer->entries && (view->active || view->registered)) {
     uint16_t cur;
     if (!GetEntry(layer, worldTileX, worldTileY, &cur)) {
       SetEntryGuess(layer, worldTileX, worldTileY, entry);
@@ -1148,7 +457,7 @@ int WsShadowDebugCell(int layerIndex, uint32_t worldTileX, uint32_t worldTileY,
                       uint16_t *entry) {
   if (layerIndex < 0 || layerIndex >= kLayers)
     return 0;
-  const WsShadowLayer *layer = &s_layers[layerIndex];
+  const WsShadowLayer *layer = EntryStore(&s_layers[layerIndex]);
   uint16_t e = 0;
   if (!GetEntry(layer, worldTileX, worldTileY, &e))
     return 0;
@@ -1171,48 +480,33 @@ void WsShadowForceTile(int layerIndex, uint32_t worldTileX,
                        uint32_t worldTileY, uint16_t entry) {
   if (layerIndex < 0 || layerIndex >= kLayers)
     return;
-  WsShadowLayer *layer = &s_layers[layerIndex];
+  WsShadowLayer *view = &s_layers[layerIndex];
+  WsShadowLayer *layer = EntryStore(view);
   if (layer->retainHistory)
     return;
-  if (!layer->entries || !(layer->active || layer->registered))
+  if (!layer->entries || !(view->active || view->registered))
     return;
-  EnsureOrigin(layer);
   /* Yield to a recent game write (dynamic BG object drawn in the margin
    * through widened object windows). Stamp 0 doubles as "never written";
    * the 1-in-256 frame whose low byte is 0 merely skips one stamp. u8
    * stamps alias every 256 frames, so an ancient write can read fresh
    * for up to `respect` frames — it then serves the game's own captured
    * entry (real content, one-wrap old) rather than anything invented. */
-  if (layer->respectGameWrites && layer->cooldown) {
-    uint32_t ltx, lty;
-    if (LocalTile(layer, worldTileX, worldTileY, &ltx, &lty)) {
-      uint8_t stamp = layer->cooldown[lty * kWsShadowXTiles + ltx];
-      if (stamp) {
-        uint8_t age = (uint8_t)((snes_frame_counter & 0xFF) - stamp);
-        if (age <= (uint8_t)layer->respectGameWrites)
-          return;
-      }
+  if (layer->respectGameWrites && layer->cooldown &&
+      InBounds(worldTileX, worldTileY)) {
+    uint8_t stamp = layer->cooldown[worldTileY * kWsShadowXTiles + worldTileX];
+    if (stamp) {
+      extern int snes_frame_counter;
+      uint8_t age = (uint8_t)((snes_frame_counter & 0xFF) - stamp);
+      if (age <= (uint8_t)layer->respectGameWrites)
+        return;
     }
   }
-  s_currentWriteKind = kWsShadowWriteDecodeForce;
-  SetEntryForced(layer, worldTileX, worldTileY, entry);
-  s_currentWriteKind = kWsShadowWriteViewCapture;
-}
-
-void WsShadowCaptureTile(int layerIndex, uint32_t worldTileX,
-                         uint32_t worldTileY, uint16_t entry) {
-  if (layerIndex < 0 || layerIndex >= kLayers)
-    return;
-  WsShadowLayer *layer = &s_layers[layerIndex];
-  if (layer->retainHistory || !layer->entries || !layer->active)
-    return;
-  EnsureOrigin(layer);
-  SetEntryLive(layer, worldTileX, worldTileY, entry);
+  SetEntry(layer, worldTileX, worldTileY, entry);
 }
 
 void WsShadowForceWestViewportTile(int layerIndex, uint32_t worldTileX,
                                    uint32_t viewportRow, uint16_t entry) {
-  s_currentWriteKind = kWsShadowWriteWestViewport;
   if (layerIndex < 0 || layerIndex >= kLayers)
     return;
   WsShadowLayer *layer = &s_layers[layerIndex];
@@ -1230,7 +524,6 @@ void WsShadowForceWestViewportTile(int layerIndex, uint32_t worldTileX,
 
 void WsShadowPrefillWestViewportTile(int layerIndex, uint32_t worldTileX,
                                      uint32_t viewportRow, uint16_t entry) {
-  s_currentWriteKind = kWsShadowWriteWestViewport;
   if (layerIndex < 0 || layerIndex >= kLayers)
     return;
   WsShadowLayer *layer = &s_layers[layerIndex];
@@ -1310,9 +603,6 @@ void WsShadowContinueSeam(int layerIndex) {
  * lower row indices (up on screen), matching EstimateLiveViewportDy. */
 static void ShiftWestViewportRows(WsShadowLayer *layer, uint32_t tx0, int dy,
                                   int rows) {
-  const uint8_t saved_kind = s_currentWriteKind;
-  s_currentWriteKind = kWsShadowWriteBackfill;
-  (void)saved_kind;
   if (!layer->entries || dy == 0 || rows <= 0)
     return;
   uint16_t tmp_e[kWsLiveMaxRows];
@@ -1320,8 +610,8 @@ static void ShiftWestViewportRows(WsShadowLayer *layer, uint32_t tx0, int dy,
   const int row_n = rows < kWsLiveMaxRows ? rows : kWsLiveMaxRows;
   const int west_keep = WestKeep(layer);
   for (int64_t tx = (int64_t)tx0 - west_keep; tx < (int64_t)tx0; tx++) {
-    if (tx < 0)
-      continue; /* store bounds are enforced by the local-window transform */
+    if (tx < 0 || tx >= kWsShadowXTiles)
+      continue;
     for (int r = 0; r < row_n; r++) {
       uint16_t e = 0;
       tmp_v[r] = GetEntry(layer, (uint32_t)tx, (uint32_t)r, &e) ? 1 : 0;
@@ -1348,9 +638,6 @@ static void ShiftWestViewportRows(WsShadowLayer *layer, uint32_t tx0, int dy,
 static void BackfillWestVacatedRows(WsShadowLayer *layer, uint32_t tx0,
                                     const uint16_t *live, const uint8_t *live_occ,
                                     int cols, int rows, int dy) {
-  const uint8_t saved_kind = s_currentWriteKind;
-  s_currentWriteKind = kWsShadowWriteBackfill;
-  (void)saved_kind;
   if (!layer->entries || dy == 0 || rows <= 0 || cols <= 0)
     return;
   const int row_n = rows < kWsLiveMaxRows ? rows : kWsLiveMaxRows;
@@ -1369,8 +656,8 @@ static void BackfillWestVacatedRows(WsShadowLayer *layer, uint32_t tx0,
 
   const int west_keep = WestKeep(layer);
   for (int64_t tx = (int64_t)tx0 - west_keep; tx < (int64_t)tx0; tx++) {
-    if (tx < 0)
-      continue; /* store bounds are enforced by the local-window transform */
+    if (tx < 0 || tx >= kWsShadowXTiles)
+      continue;
     int any = 0;
     for (int r = 0; r < row_n; r++) {
       uint16_t e = 0;
@@ -1432,17 +719,14 @@ static void FillWestVerticalGapsFromLive(WsShadowLayer *layer, uint32_t tx0,
                                          const uint16_t *live,
                                          const uint8_t *live_occ, int cols,
                                          int rows) {
-  const uint8_t saved_kind = s_currentWriteKind;
-  s_currentWriteKind = kWsShadowWriteBackfill;
-  (void)saved_kind;
   if (!layer->entries || cols <= 0 || rows <= 0)
     return;
   const int row_n = rows < kWsLiveMaxRows ? rows : kWsLiveMaxRows;
   const int west_keep = WestKeep(layer);
 
   for (int64_t tx = (int64_t)tx0 - west_keep; tx < (int64_t)tx0; tx++) {
-    if (tx < 0)
-      continue; /* store bounds are enforced by the local-window transform */
+    if (tx < 0 || tx >= kWsShadowXTiles)
+      continue;
     int dist = (int)((int64_t)tx0 - tx);
     int lc = dist - 1;
     if (lc < 0)
@@ -1767,7 +1051,6 @@ static int EstimateOccMassDy(const uint8_t *prev_occ, int prev_cols,
 }
 
 void WsShadowFrame(const struct Ppu *ppu) {
-  s_currentWriteKind = kWsShadowWriteViewCapture;
   for (int i = 0; i < kLayers; i++) {
     WsShadowLayer *layer = &s_layers[i];
     layer->active = layer->registered;
@@ -1778,6 +1061,11 @@ void WsShadowFrame(const struct Ppu *ppu) {
     layer->wide = PPU_bgTilemapWider(ppu, i) != 0;
     layer->tileShift = PPU_bigTiles(ppu, i) ? 4 : 3;
     layer->worldSet = false;
+    if (layer->aliasPlus1) {
+      /* A view has no store of its own; the owner captures its viewport. */
+      layer->mapBaseWord = (uint16_t)PPU_bgTilemapAdr(ppu, i);
+      continue;
+    }
     if (layer->fold) {
       layer->foldVram = ppu->vram;
       memset(layer->foldRow, 0, sizeof(layer->foldRow));
@@ -1794,8 +1082,6 @@ void WsShadowFrame(const struct Ppu *ppu) {
           memset(layer->valid, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
         if (layer->guessOrigin)
           memset(layer->guessOrigin, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
-        if (layer->forceOrigin)
-          memset(layer->forceOrigin, 0, kWsShadowXTiles * kWsShadowYTiles / 8);
         if (layer->cooldown)
           memset(layer->cooldown, 0,
                  (size_t)kWsShadowXTiles * kWsShadowYTiles);
@@ -1815,9 +1101,6 @@ void WsShadowFrame(const struct Ppu *ppu) {
     layer->mapBaseWord = map_base_now;
 
     const unsigned sh = layer->tileShift;
-    /* tileShift is now authoritative for this frame: place or follow the
-     * scene-local window before any capture writes use it. */
-    EnsureOrigin(layer);
     const int view_cols = 256 >> sh;
     const unsigned phase = (unsigned)layer->worldX & ((1u << sh) - 1u);
     int cols = view_cols + (phase ? 1 : 0);
@@ -1866,7 +1149,7 @@ void WsShadowFrame(const struct Ppu *ppu) {
             live_occ[li] = IsLiveOpaque(tile) ? 1 : 0;
           }
         } else {
-          SetEntryLive(layer, tx0 + (uint32_t)col, ty0 + (uint32_t)row, tile);
+          SetEntry(layer, tx0 + (uint32_t)col, ty0 + (uint32_t)row, tile);
         }
       }
     }
@@ -1982,7 +1265,6 @@ void WsShadowFrame(const struct Ppu *ppu) {
       }
       /* Grow west toward live vertical extent (missing chain tops, etc.). */
       FillWestVerticalGapsFromLive(layer, tx0, live_e, live_occ, cols, rows);
-      s_currentWriteKind = kWsShadowWriteViewCapture;
       layer->lastTy0 = ty0;
       layer->lastTx0 = tx0;
       layer->haveLastOrigin = true;
@@ -2019,8 +1301,8 @@ void WsShadowFrame(const struct Ppu *ppu) {
           if (east_echo)
             ClearEntry(layer, tx, (uint32_t)row);
           else
-            SetEntryLive(layer, tx, (uint32_t)row,
-                         live_e[row * kWsLiveMaxCols + col]);
+            SetEntry(layer, tx, (uint32_t)row,
+                     live_e[row * kWsLiveMaxCols + col]);
         }
       }
 
@@ -2045,7 +1327,7 @@ void WsShadowFrame(const struct Ppu *ppu) {
       const int64_t prune_hi = wx1 + east_keep + 8;
       const int64_t row_hi = (int64_t)rows + 4;
       for (int64_t tx = prune_lo; tx < prune_hi; tx++) {
-        if (tx < 0)
+        if (tx < 0 || tx >= kWsShadowXTiles)
           continue;
         if (tx >= wx0 - west_keep && tx < wx1 + east_keep)
           continue;
@@ -2060,6 +1342,27 @@ static uint16_t FoldMapEntry(const WsShadowLayer *layer, int row, int col) {
   uint16_t word = (uint16_t)(layer->mapBaseWord +
       (col >= 32 ? 0x400 : 0) + (row << 5) + (col & 31));
   return layer->foldVram[word & 0x7fff];
+}
+
+/* Convert a live per-scanline BG scroll back into the unwrapped world epoch
+ * captured at frame start. HDMA may move hScroll by a pixel (or more) after
+ * WsShadowSetWorld/SetScroll ran. Ignoring that delta makes a margin tile
+ * straddling an 8-pixel boundary alternate between adjacent world cells even
+ * while the camera is stationary. */
+static int32_t WidescreenScrollDelta(uint16_t live, uint32_t anchor) {
+  int32_t delta = (int32_t)(((uint32_t)live - anchor) & 0x03ffu);
+  if (delta >= 0x0200)
+    delta -= 0x0400;
+  return delta;
+}
+
+int32_t WsShadowPresentWorldX(int layerIndex, int screenX,
+                              uint16_t hScroll) {
+  if (layerIndex < 0 || layerIndex >= kLayers)
+    return screenX;
+  const WsShadowLayer *layer = &s_layers[layerIndex];
+  return (int32_t)layer->worldX + screenX +
+         WidescreenScrollDelta(hScroll, layer->scrollX);
 }
 
 /* Detect the row's horizontal period over the native 32-column window
@@ -2086,23 +1389,25 @@ static uint8_t FoldRowPeriod(WsShadowLayer *layer, int row, int natCol) {
   return period;
 }
 
-uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
-                           int pixelSpan, uint32_t wrappedY,
-                           uint16_t hScroll, uint16_t mapWordAdr,
-                           uint16_t realTile) {
+uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
+                      uint16_t hScroll, uint16_t mapWordAdr,
+                      uint16_t realTile) {
   if (layerIndex < 0 || layerIndex >= kLayers)
     return realTile;
   WsShadowLayer *layer = &s_layers[layerIndex];
   /*
    * The 8x8 background renderers call once per tile chunk. A hardware window
    * can make the final chunk start inside the native viewport but extend into
-   * the right margin (for example x=255..262). Treat that whole straddling
-   * chunk as world-keyed shadow data; returning the circular VRAM tile inserts
-   * an exact one-tile seam before margin rendering begins.
+   * the right margin (for example x=255..262). Return the world-keyed shadow
+   * tile for that chunk so the renderer has both candidates. The normal 4bpp
+   * path selects between them per pixel: cartridge data remains authoritative
+   * inside X=0..255 and shadow data begins exactly at the margin boundary.
    */
   const int tile_pixels = 1 << (layer->tileShift ? layer->tileShift : 3);
+  const int native_left = layer->nativeInsetLeft;
+  const int native_right = 256 - layer->nativeInsetRight;
   if (!layer->active ||
-      (screenX >= 0 && screenX + tile_pixels <= 256))
+      (screenX >= native_left && screenX + tile_pixels <= native_right))
     return realTile;
 
   /* Layered margin sources, exact-first: (1) the world-keyed history —
@@ -2116,30 +1421,17 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
    * period inferred from a feature-free native window can no longer
    * paint filler over known feature cells. */
   const uint32_t shift = layer->tileShift ? layer->tileShift : 3;
-  int32_t worldX = (int32_t)layer->worldX + screenX;
+  int32_t worldX = WsShadowPresentWorldX(layerIndex, screenX, hScroll);
   int32_t worldY =
       layer->retainHistory
           ? (int32_t)(((wrappedY - layer->scrollY) & 0x3ff) +
                       (layer->scrollY & ((1u << shift) - 1)))
           : (int32_t)(layer->worldY +
                       ((wrappedY - layer->scrollY) & 0x3ff));
-  bool out_of_range = false;
-  if (layer->entries && worldX >= 0 && worldY >= 0) {
-    uint32_t probe_x, probe_y;
-    /* A serve whose world key is outside the scene-local window is content
-     * loss, not a routine miss: count it, log it, and let the provenance
-     * overlay show it as its own class so it can never masquerade as
-     * generic culling. */
-    out_of_range = !LocalTile(layer, (uint32_t)worldX >> shift,
-                              (uint32_t)worldY >> shift, &probe_x, &probe_y);
-    if (out_of_range) {
-      s_marginStats[layerIndex].outOfRangeRead++;
-      CacheLog(layerIndex, layer, "oob_read",
-               (int64_t)((uint32_t)worldX >> shift),
-               (int64_t)((uint32_t)worldY >> shift));
-    }
+  const WsShadowLayer *store = EntryStore(layer);
+  if (store->entries && worldX >= 0 && worldY >= 0) {
     uint16_t entry;
-    const bool hit = GetEntry(layer, (uint32_t)worldX >> shift,
+    const bool hit = GetEntry(store, (uint32_t)worldX >> shift,
                               (uint32_t)worldY >> shift, &entry);
     /* Always-on margin hit/miss accounting, split by side. Cheap counters, no
      * arming: without them "the gutter looks the same" is indistinguishable
@@ -2151,24 +1443,8 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
     } else {
       if (hit) st->eastHit++; else st->eastMiss++;
     }
-    if (hit) {
-      const uint32_t tx = (uint32_t)worldX >> shift;
-      const uint32_t ty = (uint32_t)worldY >> shift;
-      const bool generated = IsGuessOrigin(layer, tx, ty) ||
-                             IsForceOrigin(layer, tx, ty);
-      if (generated && layer->served) {
-        uint32_t ltx, lty;
-        if (LocalTile(layer, tx, ty, &ltx, &lty)) {
-          const uint32_t cell = lty * kWsShadowXTiles + ltx;
-          layer->served[cell >> 3] |= (uint8_t)(1u << (cell & 7));
-        }
-      }
-      RecordDebugProvenance(
-          layerIndex, screenX, screenY, pixelSpan,
-          generated ? kWsShadowProvenancePrefill
-                    : kWsShadowProvenanceCaptured);
+    if (hit)
       return entry;
-    }
   }
 
   if (layer->fold && layer->foldVram) {
@@ -2185,9 +1461,6 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
             s_marginStats[layerIndex].westFold++;
           else
             s_marginStats[layerIndex].eastFold++;
-          RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
-                                out_of_range ? kWsShadowProvenanceOutOfRange
-                                         : kWsShadowProvenanceFold);
           return FoldMapEntry(layer, row, (natCol + rel % period) & 63);
         }
         return realTile;  /* native column (or margin overlapping it) */
@@ -2195,48 +1468,25 @@ uint16_t WsShadowTileDebug(int layerIndex, int screenX, int screenY,
     }
   }
 
-  if (layer->blankTilePlus1) {
+  if (store->blankTilePlus1) {
     if (screenX < 0)
       s_marginStats[layerIndex].westBlank++;
     else
       s_marginStats[layerIndex].eastBlank++;
-    RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
-                          out_of_range ? kWsShadowProvenanceOutOfRange
-                                       : kWsShadowProvenanceBlank);
-    return (uint16_t)(layer->blankTilePlus1 - 1);
-  }
-  if (layer->rawContinuation && layer->wide) {
-    if (screenX < 0)
-      s_marginStats[layerIndex].westRawContinuation++;
-    else
-      s_marginStats[layerIndex].eastRawContinuation++;
-    RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
-                          out_of_range
-                              ? kWsShadowProvenanceOutOfRange
-                              : kWsShadowProvenanceRawContinuation);
-    return realTile;
+    return (uint16_t)(store->blankTilePlus1 - 1);
   }
   if (screenX < 0)
     s_marginStats[layerIndex].westRawFallback++;
   else
     s_marginStats[layerIndex].eastRawFallback++;
-  RecordDebugProvenance(layerIndex, screenX, screenY, pixelSpan,
-                        out_of_range ? kWsShadowProvenanceOutOfRange
-                                     : kWsShadowProvenanceRawFallback);
   return realTile;
-}
-
-uint16_t WsShadowTile(int layerIndex, int screenX, uint32_t wrappedY,
-                      uint16_t hScroll, uint16_t mapWordAdr,
-                      uint16_t realTile) {
-  return WsShadowTileDebug(layerIndex, screenX, -1, 0, wrappedY, hScroll,
-                           mapWordAdr, realTile);
 }
 
 bool WsShadowLayerActive(int layerIndex) {
   return layerIndex >= 0 && layerIndex < kLayers &&
          s_layers[layerIndex].active &&
-         (s_layers[layerIndex].fold || s_layers[layerIndex].entries);
+         (s_layers[layerIndex].fold || s_layers[layerIndex].entries ||
+          s_layers[layerIndex].aliasPlus1);
 }
 
 uint32_t WsShadowWorldX(int layerIndex) {

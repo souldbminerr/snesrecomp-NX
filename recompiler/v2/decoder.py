@@ -875,7 +875,19 @@ def _resolve_indirect_dispatch_targets(rom: bytes, bank: int, insn,
         addr16 = rom[off] | (rom[off + 1] << 8)
         if entry_size == 3:
             eb = rom[off + 2]
-            entries.append((eb << 16) | addr16)
+            entries.append(0 if (eb == 0 and addr16 == 0)
+                           else ((eb << 16) | addr16))
+        elif addr16 == 0:
+            # A null slot inside a declared table is a null entry, as the
+            # explicit `targets:` form already treats a 0: codegen emits
+            # the unpop-and-fall-through arm for it. Without this the slot
+            # became $BB:0000 and the declaration failed the range check,
+            # so a table with null gaps could only ever be auto-read up to
+            # its first gap. DKC2's sprite sub-state dispatcher at
+            # $B3:CB3D indexes a 16-slot table whose slots 8-13 mirror
+            # 0-5 for objects with sub-state bit 3 set; auto-read to six,
+            # every such object's behaviour script stopped stepping.
+            entries.append(0)
         else:
             entries.append((bank << 16) | addr16)
         tbl_pc += entry_size

@@ -2,7 +2,6 @@
 #define SNESRECOMP_WS_SHADOW_H
 
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
 
 // Presentation-only, world-keyed BG tilemap storage for streaming games.
@@ -11,20 +10,17 @@
 // layers, and both 64-wide and streamed 32-wide tilemaps.
 enum {
   kWsShadowXTiles = 4096,
-  kWsShadowYTiles = 512,
+  /* A 10-bit PPU phase unwrapped against a tall level can legitimately
+   * select tile row 512 before the 224-pixel viewport is added. DKC2's
+   * Topsail Trouble reaches rows 512-540 at its lower camera limit, and
+   * Parrot Chute Panic is 13,040 pixels tall: its keys pass row 1,700 near
+   * the bottom, where a 1,024-row store silently rejected every capture
+   * and prefill and the terrain margins fell to the blank tile. Keep
+   * 16,384 pixels of world Y so those exact world keys are retained. */
+  kWsShadowYTiles = 2048,
 };
 
 void WsShadowReset(void);
-
-/* Sparse host-presentation snapshot. Native SNES save states do not contain
- * the world-keyed margin cache, so reloading used to erase the exact history
- * that produced a live widescreen artifact. Games with a versioned extra
- * save chunk can append this opaque blob and restore it before their
- * post-load hook runs. The format is bounds-checked and self-describing;
- * diagnostic provenance pixels are deliberately excluded. */
-size_t WsShadowSnapshotSize(void);
-bool WsShadowSnapshotSave(void *data, size_t size);
-bool WsShadowSnapshotLoad(const void *data, size_t size);
 
 /* True world-space camera origin for shadow keys (tile capture / margins).
  * For games where PPU scroll == camera (SMW-style), pass hScroll/vScroll.
@@ -46,14 +42,6 @@ void WsShadowSetBlankTile(int layer, int blankEntry);
 // exact period keep the plain map-wrap fallback. Mutually exclusive with
 // WsShadowSetWorld for the same layer (the last registration wins).
 void WsShadowSetPeriodicFold(int layer);
-
-/* Permit a widened 64-column tilemap layer to serve the exact map entry the
- * PPU already resolved outside the native 256-pixel viewport. This is for
- * independently-authored parallax planes whose second tilemap screen is
- * valid content, not a circular streaming buffer. It is deliberately
- * accounted separately from RawFallback so enabling it cannot hide an
- * unsafe terrain-ring miss from regression tooling. */
-void WsShadowSetRawContinuation(int layer, bool enabled);
 
 /* Keep world-keyed entries across frames instead of clearing every present.
  * The viewport capture still overwrites in-view tiles each frame, so only
@@ -99,67 +87,9 @@ typedef struct WsShadowMarginStat {
    * folded, or verified-blank source was available. */
   uint64_t westFold, eastFold;
   uint64_t westBlank, eastBlank;
-  uint64_t westRawContinuation, eastRawContinuation;
   uint64_t westRawFallback, eastRawFallback;
-  /* Scene-local window accounting. The store is indexed by world tile MINUS
-   * a per-layer aligned origin that follows the camera, so high absolute
-   * world coordinates (bonus stages parked deep in the coordinate map) stay
-   * cacheable. outOfRange* count keys that still fell outside the rebased
-   * window — nonzero means content was lost and must be investigated, never
-   * shrugged off as a generic margin miss. originRebase counts window moves.
-   * Set SNESRECOMP_WS_CACHE_LOG=<path> for a per-event jsonl detail log. */
-  uint64_t outOfRangeRead, outOfRangeWrite, originRebase;
-  /* Stream retrodiction: a generated margin entry (prefill guess or exact
-   * decoder fill) that was actually SERVED to the renderer is compared
-   * against the game's own native capture when that world tile later
-   * enters the view. A mismatch proves wrong art was shown in the margin
-   * — decoder bug, stale cache, or world-key error — with the game itself
-   * as the oracle. Set SNESRECOMP_WS_RETRODICT=<path> for per-event jsonl. */
-  uint64_t retrodictChecked, retrodictMismatch;
 } WsShadowMarginStat;
 void WsShadowGetMarginStats(int layer, WsShadowMarginStat *out);
-
-/* Host-only margin provenance capture. Disabled by default and never part of
- * emulated or serialized state. When armed, the PPU's background renderers
- * record the exact source selected for each widened-margin pixel. */
-typedef enum WsShadowProvenance {
-  kWsShadowProvenanceNone = 0,
-  kWsShadowProvenanceCaptured,
-  kWsShadowProvenancePrefill,
-  kWsShadowProvenanceFold,
-  kWsShadowProvenanceBlank,
-  kWsShadowProvenanceRawContinuation,
-  kWsShadowProvenanceRawFallback,
-  /* The margin's world key fell outside the scene-local cache window; the
-   * art shown came from a fallback that cannot be world-correct. */
-  kWsShadowProvenanceOutOfRange,
-} WsShadowProvenance;
-void WsShadowDebugSetProvenanceEnabled(bool enabled);
-bool WsShadowDebugProvenanceEnabled(void);
-void WsShadowDebugBeginFrame(void);
-uint8_t WsShadowDebugProvenanceAt(int layer, int screenX, int screenY);
-
-/* Current scene-local origins (in tiles of the layer's tile size). Purely
- * diagnostic; world-keyed public APIs are unaffected by rebasing. */
-void WsShadowDebugOrigin(int layer, long long *originTx, long long *originTy);
-
-/* Per-cell last-writer attribution for the click-to-provenance inspector.
- * Armed by SNESRECOMP_WS_WRITE_TRACE=1 (lazy, ~10 MB/layer). Returns 0
- * when unarmed or the cell has no recorded writer; else a nonzero kind and
- * the snes frame of the last write. Attribution is cleared on window
- * rebase/scene reset (diagnostic data only). */
-typedef enum WsShadowWriteKind {
-  kWsShadowWriteNone = 0,
-  kWsShadowWriteViewCapture,   /* native view sweep from real VRAM */
-  kWsShadowWriteUploadMirror,  /* game's own VRAM upload (OnVramWrite) */
-  kWsShadowWriteDecodeForce,   /* exact ROM decoder fill (ForceTile) */
-  kWsShadowWritePrefillGuess,  /* CPU-side map guess (PrefillTile) */
-  kWsShadowWriteWestViewport,  /* west strip keyed by viewport row */
-  kWsShadowWriteBackfill,      /* backfill/shift/gap heuristics */
-} WsShadowWriteKind;
-int WsShadowDebugLastWriter(int layer, uint32_t worldTileX,
-                            uint32_t worldTileY, uint32_t *frame);
-const char *WsShadowWriteKindName(int kind);
 
 /* Read-only diagnostic lookup in the world-keyed store. This does not alter
  * hit/miss counters or renderer state. It lets offline route audits compare
@@ -173,6 +103,19 @@ bool WsShadowLookupWorldTile(int layer, uint32_t worldTileX,
  * 2 = prefill guess (still refreshable). *entry is set for 1/2. */
 int WsShadowDebugCell(int layer, uint32_t worldTileX, uint32_t worldTileY,
                       uint16_t *entry);
+
+/* Serve one BG layer's margin lookups from another layer's world-keyed
+ * entries. A game whose HDMA lets two physical layers display the same
+ * streamed world map on different scanline bands registers the second layer
+ * as a read-only view of the owner's store. The view keeps its own
+ * world/scroll keys, so the renderer's per-line scroll delta selects the
+ * exact world cell for whichever band that layer shows. An aliased layer
+ * captures no viewport rows, records no VRAM writes of its own, and never
+ * allocates a store. Re-register every frame, like WsShadowSetWorld. */
+void WsShadowSetEntryAlias(int layer, int sourceLayer, uint32_t worldX,
+                           uint32_t worldY, uint32_t scrollX,
+                           uint32_t scrollY);
+void WsShadowClearEntryAlias(int layer);
 
 /* When set, capture columns east of the 256px view that match any live
  * view column are cleared instead of stored — kills VRAM-wrap / period
@@ -193,14 +136,6 @@ void WsShadowPrefillTile(int layer, uint32_t worldTileX, uint32_t worldTileY,
 /* Like PrefillTile but always writes (DMA-pad VRAM beats $7F guesses). */
 void WsShadowForceTile(int layer, uint32_t worldTileX, uint32_t worldTileY,
                        uint16_t entry);
-
-/* Record an authoritative tile from the game's live rolling map. Unlike
- * ForceTile this is captured provenance (not generated/prefilled data) and
- * participates in retrodiction checks exactly like the ordinary viewport
- * sweep. Hosts with checksum-verified wider cartridge streams can use this
- * to ingest valid columns on both sides of the native viewport. */
-void WsShadowCaptureTile(int layer, uint32_t worldTileX, uint32_t worldTileY,
-                         uint16_t entry);
 
 /* ForceTile yields to world cells the game itself wrote (via
  * WsShadowOnVramWrite) within the last `frames` frames (0 = off, max 250).
@@ -254,6 +189,13 @@ void WsShadowFrame(const struct Ppu *ppu);
 // inactive layers/addresses.
 void WsShadowOnVramWrite(uint16_t wordAdr, uint16_t value);
 
+/* Frame stamp of the last VRAM word write into each 1024-word page (32
+ * pages), as the frame counter plus one; zero for a page never written
+ * since start. Recorded for every write, whether or not a layer is
+ * registered, so a host can tell a static, fully authored plane from a
+ * ring the cartridge keeps streaming. */
+uint32_t WsShadowVramPageWriteFrame(unsigned page);
+
 // mapWordAdr = the VRAM word address the renderer fetched realTile from
 // (used by fold mode to recover the exact map row/column, independent of
 // scroll bias and window splits). hScroll = the layer's live per-line
@@ -262,10 +204,21 @@ void WsShadowOnVramWrite(uint16_t wordAdr, uint16_t value);
 uint16_t WsShadowTile(int layer, int screenX, uint32_t wrappedY,
                       uint16_t hScroll, uint16_t mapWordAdr,
                       uint16_t realTile);
-uint16_t WsShadowTileDebug(int layer, int screenX, int screenY, int pixelSpan,
-                           uint32_t wrappedY, uint16_t hScroll,
-                           uint16_t mapWordAdr, uint16_t realTile);
 bool WsShadowLayerActive(int layer);
+
+/* Presented world X includes the signed 10-bit delta from the frame-latched
+ * scroll to the live per-scanline HDMA scroll, matching margin tile keys. */
+int32_t WsShadowPresentWorldX(int layer, int screenX, uint16_t hScroll);
+/* Mark screen columns at either end of the PPU's 256-column window that the
+ * cartridge's authentic VRAM window does not cover this frame, so lookups
+ * there use the world-keyed store instead of the raw ring. A host presenting
+ * the view shifted right by a bias passes (0, bias); shifted left, (-bias,
+ * 0). Reset by WsShadowSetWorld; re-apply after it every frame. The
+ * renderer's native/shadow pixel split follows WsShadowNativeLeft/Right. */
+void WsShadowSetNativeViewportInset(int layer, int leftPixels,
+                                    int rightPixels);
+int WsShadowNativeLeft(int layer);
+int WsShadowNativeRight(int layer);
 
 /* Latched world/scroll origins for margin pixel-phase (must match tile keys). */
 uint32_t WsShadowWorldX(int layer);

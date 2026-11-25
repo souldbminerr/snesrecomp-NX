@@ -35,6 +35,21 @@ uint32_t WsShadowWorldX(int layer) {
   return 0;
 }
 
+int32_t WsShadowPresentWorldX(int layer, int screen_x, uint16_t h_scroll) {
+  (void)layer;
+  return screen_x + (int32_t)h_scroll;
+}
+
+int WsShadowNativeLeft(int layer) {
+  (void)layer;
+  return 0;
+}
+
+int WsShadowNativeRight(int layer) {
+  (void)layer;
+  return 256;
+}
+
 uint32_t WsShadowWorldY(int layer) {
   (void)layer;
   return 0;

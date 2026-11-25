@@ -140,6 +140,12 @@ void PpuSetWidescreenLineEnhancer(Ppu *ppu,
                                   void *context) {
   ppu->widescreenLineEnhancer = enhancer;
   ppu->widescreenLineEnhancerContext = enhancer ? context : NULL;
+  if (!enhancer)
+    ppu->wsLineEnhancerWideLayers = 0;
+}
+
+void PpuSetWidescreenLineEnhancerWideLayers(Ppu *ppu, uint8_t layer_mask) {
+  ppu->wsLineEnhancerWideLayers = (uint8_t)(layer_mask & 0x0fu);
 }
 
 void PpuClearOverlayCaptures(Ppu *ppu) {
@@ -206,10 +212,17 @@ static inline void PpuResetLayerPolicies(Ppu *ppu) {
   ppu->wsLayerClamp = 0;
   ppu->wsLayerMirror = 0;
   ppu->wsLayerRepeat = 0;
+  memset(ppu->wsLayerRepeatPeriod, 0, sizeof(ppu->wsLayerRepeatPeriod));
+  memset(ppu->wsLayerRepeatEdgeRepair, 0,
+         sizeof(ppu->wsLayerRepeatEdgeRepair));
+  ppu->wsLayerRepeatAutoPeriod = 0;
+  ppu->wsLayerRepeatAutoEdgeRepair = 0;
   memset(ppu->wsClampY0, 0, sizeof(ppu->wsClampY0));
   memset(ppu->wsClampY1, 0, sizeof(ppu->wsClampY1));
   memset(ppu->wsRepeatY0, 0, sizeof(ppu->wsRepeatY0));
   memset(ppu->wsRepeatY1, 0, sizeof(ppu->wsRepeatY1));
+  memset(ppu->wsRawY0, 0, sizeof(ppu->wsRawY0));
+  memset(ppu->wsRawY1, 0, sizeof(ppu->wsRawY1));
   memset(ppu->wsStretchY0, 0, sizeof(ppu->wsStretchY0));
   memset(ppu->wsStretchY1, 0, sizeof(ppu->wsStretchY1));
   memset(ppu->wsAnchorY0, 0, sizeof(ppu->wsAnchorY0));
@@ -387,6 +400,29 @@ void PpuSetWidescreenLayerRepeat(Ppu *ppu, uint8_t mask) {
   ppu->wsLayerRepeat = mask;
 }
 
+void PpuSetWidescreenLayerRepeatPeriod(Ppu *ppu, uint8_t layer,
+                                       uint16_t period) {
+  if (layer >= 4)
+    return;
+  ppu->wsLayerRepeatPeriod[layer] =
+      period <= kPpuXPixels ? period : kPpuXPixels;
+}
+
+void PpuSetWidescreenLayerRepeatAutoPeriod(Ppu *ppu, uint8_t period_mask,
+                                           uint8_t edge_repair_mask) {
+  ppu->wsLayerRepeatAutoPeriod = period_mask & 0x0f;
+  ppu->wsLayerRepeatAutoEdgeRepair = edge_repair_mask & period_mask & 0x0f;
+}
+
+void PpuSetWidescreenLayerRepeatEdgeRepair(Ppu *ppu, uint8_t layer,
+                                           uint8_t pixels) {
+  if (layer >= 4)
+    return;
+  const uint16_t period = ppu->wsLayerRepeatPeriod[layer];
+  ppu->wsLayerRepeatEdgeRepair[layer] =
+      period != 0 && pixels < period ? pixels : 0;
+}
+
 void PpuSetWidescreenLayerClampBand(Ppu *ppu, uint8_t layer, uint8_t y0,
                                     uint8_t y1) {
   if (layer < 4) {
@@ -400,6 +436,14 @@ void PpuSetWidescreenLayerRepeatBand(Ppu *ppu, uint8_t layer, uint8_t y0,
   if (layer < 4) {
     ppu->wsRepeatY0[layer] = y0;
     ppu->wsRepeatY1[layer] = y1;
+  }
+}
+
+void PpuSetWidescreenLayerRawBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                  uint8_t y1) {
+  if (layer < 4) {
+    ppu->wsRawY0[layer] = y0;
+    ppu->wsRawY1[layer] = y1;
   }
 }
 
@@ -588,9 +632,10 @@ typedef struct PpuWindows {
 // the margins -- EXCEPT on scanlines >= wsBg3WidenY, where the game renders
 // level content on BG3 (e.g. SMW water) that should fill 16:9 like BG1/BG2.
 static void PpuWindows_Clear(PpuWindows *win, Ppu *ppu, uint layer, int y) {
-  win->edges[0] = -PpuWidescreenLayerExtra(ppu, layer, y, ppu->extraLeftCur);
+  win->edges[0] = -PpuWidescreenLayerExtra(ppu, layer, y, ppu->extraLeftCur,
+                                           false);
   win->edges[1] = 256 + PpuWidescreenLayerExtra(ppu, layer, y,
-                                                ppu->extraRightCur);
+                                                ppu->extraRightCur, true);
   win->nr = 1;
   win->bits = 0;
 }
@@ -603,8 +648,8 @@ static void PpuWindows_CalcWithExtra(PpuWindows *win, Ppu *ppu, uint layer,
   uint32 winflags = GET_WINDOW_FLAGS(ppu, layer);
   uint nr = 1;
   int window_right = 256 +
-      PpuWidescreenLayerExtra(ppu, layer, y, extra_right);
-  win->edges[0] = -PpuWidescreenLayerExtra(ppu, layer, y, extra_left);
+      PpuWidescreenLayerExtra(ppu, layer, y, extra_right, true);
+  win->edges[0] = -PpuWidescreenLayerExtra(ppu, layer, y, extra_left, false);
   win->edges[1] = window_right;
   uint i, j;
   int t;
@@ -783,6 +828,8 @@ static bool PpuViewportAllows(Ppu *ppu, uint layer, int screen_x,
                               int source_x) {
   if (!ppu->widescreenLineEnhancer)
     return true;
+  if (ppu->wsLineEnhancerWideLayers & (uint8_t)(1u << layer))
+    return true;
   if (ppu->wsViewportInsetL[layer] | ppu->wsViewportInsetR[layer])
     return source_x >= ppu->wsViewportInsetL[layer] &&
            source_x < kPpuXPixels - ppu->wsViewportInsetR[layer];
@@ -792,11 +839,57 @@ static bool PpuViewportAllows(Ppu *ppu, uint layer, int screen_x,
   return layer != 0 || (screen_x >= 0 && screen_x < kPpuXPixels);
 }
 
+/* A shadow lookup is tile-granular, but the native-center contract is
+ * pixel-granular. Fine scroll can make one 8-pixel chunk straddle X=0 or
+ * X=256. Decode that chunk from the cartridge tile for center pixels and
+ * from the world-shadow tile for margin pixels; selecting either tile for
+ * the whole chunk creates a visible seam on one side or changes the 256-pixel
+ * oracle on the other. */
+static void PpuDrawMixed4bppTile(Ppu *ppu, PpuZbufType *dstz, uint layer,
+                                 int source_bias, int screen_x,
+                                 int source_offset, int count,
+                                 uint16 real_tile, uint16 shadow_tile,
+                                 int tileadr0, int tileadr1,
+                                 PpuZbufType zhi, PpuZbufType zlo) {
+  const int native_left = WsShadowNativeLeft((int)layer);
+  const int native_right = WsShadowNativeRight((int)layer);
+  for (int j = 0; j < count; j++) {
+    const int sx = screen_x + j;
+    const uint16 tile = sx >= native_left && sx < native_right
+                            ? real_tile
+                            : shadow_tile;
+    const int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+    const uint16 *addr =
+        &ppu->vram[(ta + (tile & 0x03ffu) * 16u) & 0x7fffu];
+    const uint32 bits = (uint32)addr[0] | (uint32)addr[8] << 16;
+    const int i = source_offset + j;
+    int pixel;
+    if (tile & 0x4000u) {
+      pixel = (int)((bits >> i) & 1u) |
+              (int)((bits >> (7 + i)) & 2u) |
+              (int)((bits >> (14 + i)) & 4u) |
+              (int)((bits >> (21 + i)) & 8u);
+    } else {
+      pixel = (int)((bits >> (7 - i)) & 1u) |
+              (int)((bits >> (14 - i)) & 2u) |
+              (int)((bits >> (21 - i)) & 4u) |
+              (int)((bits >> (28 - i)) & 8u);
+    }
+    if (!pixel ||
+        !PpuViewportAllows(ppu, layer, sx, sx + source_bias))
+      continue;
+    PpuZbufType z = (tile & 0x2000u) ? zhi : zlo;
+    z += (tile & 0x1c00u) >> 6;
+    if (z > dstz[j])
+      dstz[j] = z + pixel;
+  }
+}
+
 // Draw a whole line of a 4bpp background layer into bgBuffers
 static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
                                    uint y, bool sub, uint layer,
                                    PpuZbufType zhi, PpuZbufType zlo) {
-  const int screen_y = (int)y;
+  const uint visible_y = y;
 #define VIEWPORT_ALLOWED(i) \
   PpuViewportAllows(ppu, layer, \
       (int)(dstz + (i) - dstbuf->data - kPpuExtraLeftRight), \
@@ -822,14 +915,26 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
     sc_offs += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
   const uint16 *tps[2] = {
-    &PpuRenderVram(ppu)[sc_offs & 0x7fff],
-    &PpuRenderVram(ppu)[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
+    &ppu->vram[sc_offs & 0x7fff],
+    &ppu->vram[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
   };
   int tileadr = PPU_bgTileAdr(ppu, layer), pixel;
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
   const uint16 *addr;
-  bool ws_shadow = WsShadowLayerActive(layer);
-#define WS_TILE(t, sx, span) (ws_shadow ? WsShadowTileDebug(layer, (sx), screen_y, (span), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - PpuRenderVram(ppu)), (uint16_t)(t)) : (uint32)(t))
+  /* A repeat band promises the authentic native scanline as its source.
+   * The world shadow is keyed to the frame's terrain role and may be invalid
+   * when HDMA repurposes this layer for another scanline band. Bypass it for
+   * the isolated native render; the repeat merge then changes margins only
+   * and leaves the cartridge's 256-pixel center pixel-exact. */
+  bool ws_shadow = WsShadowLayerActive(layer) &&
+      !PpuWidescreenLayerRepeatBandActive(ppu, layer, (int)visible_y) &&
+      !PpuWidescreenLayerRawBandActive(ppu, layer, (int)visible_y);
+  /* Columns the cartridge's authentic VRAM window covers this line; a host
+   * presentation bias narrows it on one side (WsShadowSetNativeViewportInset). */
+  const int native_left = ws_shadow ? WsShadowNativeLeft(layer) : 0;
+  const int native_right =
+      ws_shadow ? WsShadowNativeRight(layer) : kPpuXPixels;
+#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - ppu->vram), (uint16_t)(t)) : (uint32)(t))
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
@@ -844,30 +949,59 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     // Handle clipped pixels on left side
     if (x & 7) {
       int curw = IntMin(8 - (x & 7), w);
+      const int source_offset = x & 7;
+      const int segment_x = ws_sx;
       w -= curw;
-      uint32 tile = WS_TILE(*tp, ws_sx, curw);
+      const uint16 real_tile = *tp;
+      uint32 tile = WS_TILE(real_tile, ws_sx);
       ws_sx += curw;
       NEXT_TP();
-      int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
-      PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
-      uint32 bits = READ_BITS(ta, tile & 0x3ff);
-      if (bits) {
-        z += ((tile & 0x1c00) >> kPaletteShift);
-        if (tile & 0x4000) {
-          bits >>= (x & 7), x += curw;
-          do DO_PIXEL(0); while (bits >>= 1, dstz++, --curw);
-        } else {
-          bits <<= (x & 7), x += curw;
-          do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --curw);
-        }
-      } else {
+      const bool mixed_tile = ws_shadow && tile != real_tile &&
+          ((segment_x < native_left && segment_x + curw > native_left) ||
+           (segment_x < native_right &&
+            segment_x + curw > native_right));
+      if (mixed_tile) {
+        PpuDrawMixed4bppTile(
+            ppu, dstz, layer, ws_bias[windex], segment_x,
+            source_offset, curw, real_tile, (uint16)tile,
+            tileadr0, tileadr1, zhi, zlo);
+        x += curw;
         dstz += curw;
+      } else {
+        int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+        PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+        uint32 bits = READ_BITS(ta, tile & 0x3ff);
+        if (bits) {
+          z += ((tile & 0x1c00) >> kPaletteShift);
+          if (tile & 0x4000) {
+            bits >>= (x & 7), x += curw;
+            do DO_PIXEL(0); while (bits >>= 1, dstz++, --curw);
+          } else {
+            bits <<= (x & 7), x += curw;
+            do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --curw);
+          }
+        } else {
+          dstz += curw;
+        }
       }
     }
     // Handle full tiles in the middle
     while (w >= 8) {
-      uint32 tile = WS_TILE(*tp, ws_sx, 8);
+      const int segment_x = ws_sx;
+      const uint16 real_tile = *tp;
+      uint32 tile = WS_TILE(real_tile, ws_sx);
       NEXT_TP();
+      if (ws_shadow && tile != real_tile &&
+          ((segment_x < native_left && segment_x + 8 > native_left) ||
+           (segment_x < native_right &&
+            segment_x + 8 > native_right))) {
+        PpuDrawMixed4bppTile(
+            ppu, dstz, layer, ws_bias[windex], segment_x,
+            0, 8, real_tile, (uint16)tile,
+            tileadr0, tileadr1, zhi, zlo);
+        dstz += 8, w -= 8, ws_sx += 8;
+        continue;
+      }
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -885,7 +1019,19 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
     }
     // Handle remaining clipped part
     if (w) {
-      uint32 tile = WS_TILE(*tp, ws_sx, (int)w);
+      const int segment_x = ws_sx;
+      const uint16 real_tile = *tp;
+      uint32 tile = WS_TILE(real_tile, ws_sx);
+      if (ws_shadow && tile != real_tile &&
+          ((segment_x < native_left && segment_x + (int)w > native_left) ||
+           (segment_x < native_right &&
+            segment_x + (int)w > native_right))) {
+        PpuDrawMixed4bppTile(
+            ppu, dstz, layer, ws_bias[windex], segment_x,
+            0, (int)w, real_tile, (uint16)tile,
+            tileadr0, tileadr1, zhi, zlo);
+        continue;
+      }
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -1016,13 +1162,13 @@ static void PpuDrawBackgroundBig(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
       /* Margins: world-keyed shadow tile + matching world pixel phase.
        * Using live hScroll/vScroll for px/py while the tile key used the
        * NMI-latched world origin produced a persistent ~phase seam. */
-      if (ws_shadow && (screen_x < 0 || screen_x >= 256)) {
-        tile = WsShadowTileDebug((int)layer, screen_x, (int)y, 1,
-                                 (uint32_t)sy,
-                                 (uint16_t)ppu->hScroll[layer],
-                                 (uint16_t)(sc & 0x7fff), tile);
-        const int32_t wpx =
-            (int32_t)WsShadowWorldX((int)layer) + screen_x;
+      if (ws_shadow && (screen_x < WsShadowNativeLeft((int)layer) ||
+                        screen_x >= WsShadowNativeRight((int)layer))) {
+        tile = WsShadowTile((int)layer, screen_x, (uint32_t)sy,
+                            (uint16_t)ppu->hScroll[layer],
+                            (uint16_t)(sc & 0x7fff), tile);
+        const int32_t wpx = WsShadowPresentWorldX(
+            (int)layer, screen_x, (uint16_t)ppu->hScroll[layer]);
         const int32_t wpy =
             (int32_t)WsShadowPresentWorldY((int)layer, screen_x) +
             (int32_t)((sy - WsShadowScrollY((int)layer)) & 0x3ff);
@@ -1251,14 +1397,48 @@ static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
 }
 
 // Draw a whole line of a 2bpp background layer into bgBuffers
+/* One boundary chunk of a 2bpp layer under the world-keyed shadow: the
+ * cartridge's tile inside the authentic window, the shadow tile outside it,
+ * selected per pixel (the 2bpp twin of PpuDrawMixed4bppTile). */
+static void PpuDrawMixed2bppTile(Ppu *ppu, PpuZbufType *dstz, uint layer,
+                                 int screen_x, int source_offset, int count,
+                                 uint16 real_tile, uint16 shadow_tile,
+                                 int tileadr0, int tileadr1,
+                                 PpuZbufType zhi, PpuZbufType zlo) {
+  const int native_left = WsShadowNativeLeft((int)layer);
+  const int native_right = WsShadowNativeRight((int)layer);
+  for (int j = 0; j < count; j++) {
+    const int sx = screen_x + j;
+    const uint16 tile = sx >= native_left && sx < native_right
+                            ? real_tile
+                            : shadow_tile;
+    const int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+    const uint32 bits = ppu->vram[(ta + (tile & 0x03ffu) * 8u) & 0x7fffu];
+    const int i = source_offset + j;
+    int pixel;
+    if (tile & 0x4000u) {
+      pixel = (int)((bits >> i) & 1u) | (int)((bits >> (7 + i)) & 2u);
+    } else {
+      pixel = (int)((bits >> (7 - i)) & 1u) | (int)((bits >> (14 - i)) & 2u);
+    }
+    if (!pixel)
+      continue;
+    PpuZbufType z = (tile & 0x2000u) ? zhi : zlo;
+    z += (tile & 0x1c00u) >> 8;
+    if (z > dstz[j])
+      dstz[j] = z + pixel;
+  }
+}
+
 static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
+  const uint visible_y = y;
 #define DO_PIXEL(i) do { \
   pixel = (bits >> i) & 1 | (bits >> (7 + i)) & 2; \
   if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
 #define DO_PIXEL_HFLIP(i) do { \
   pixel = (bits >> (7 - i)) & 1 | (bits >> (14 - i)) & 2; \
   if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
-#define READ_BITS(ta, tile) (addr = &PpuRenderVram(ppu)[(ta) + (tile) * 8 & 0x7fff], addr[0])
+#define READ_BITS(ta, tile) (addr = &ppu->vram[(ta) + (tile) * 8 & 0x7fff], addr[0])
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
@@ -1299,18 +1479,29 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, b
   if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
     sc_offs += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
   const uint16 *tps[2] = {
-    &PpuRenderVram(ppu)[sc_offs & 0x7fff],
-    &PpuRenderVram(ppu)[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
+    &ppu->vram[sc_offs & 0x7fff],
+    &ppu->vram[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
   };
   int tileadr = PPU_bgTileAdr(ppu, layer), pixel;
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
-
   const uint16 *addr;
+  /* A 2bpp layer under the world-keyed shadow (a game's 64-column BG3
+   * foreground) resolves its margin chunks exactly like the 4bpp layers:
+   * the shadow tile outside the authentic window, the cartridge tile inside
+   * it, and a per-pixel split for the chunk straddling that boundary. */
+  bool ws_shadow = WsShadowLayerActive(layer) &&
+      !PpuWidescreenLayerRepeatBandActive(ppu, layer, (int)visible_y) &&
+      !PpuWidescreenLayerRawBandActive(ppu, layer, (int)visible_y);
+  const int native_left = ws_shadow ? WsShadowNativeLeft(layer) : 0;
+  const int native_right =
+      ws_shadow ? WsShadowNativeRight(layer) : kPpuXPixels;
+#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - ppu->vram), (uint16_t)(t)) : (uint32)(t))
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
     uint x = win.edges[windex] + ppu->hScroll[layer] + ws_bias[windex];
     uint w = win.edges[windex + 1] - win.edges[windex];
+    int ws_sx = win.edges[windex];
     PpuZbufType *dstz = dstbuf->data + win.edges[windex] + kPpuExtraLeftRight;
     const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
     const uint16 *tp_last = tps[x >> 8 & 1] + 31;
@@ -1320,29 +1511,58 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, b
     // Handle clipped pixels on left side
     if (x & 7) {
       int curw = IntMin(8 - (x & 7), w);
+      const int source_offset = x & 7;
+      const int segment_x = ws_sx;
       w -= curw;
-      uint32 tile = *tp;
+      const uint16 real_tile = *tp;
+      uint32 tile = WS_TILE(real_tile, ws_sx);
+      ws_sx += curw;
       NEXT_TP();
-      int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
-      PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
-      uint32 bits = READ_BITS(ta, tile & 0x3ff);
-      if (bits) {
-        z += ((tile & 0x1c00) >> kPaletteShift);
-        if (tile & 0x4000) {
-          bits >>= (x & 7), x += curw;
-          do DO_PIXEL(0); while (bits >>= 1, dstz++, --curw);
-        } else {
-          bits <<= (x & 7), x += curw;
-          do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --curw);
-        }
-      } else {
+      const bool mixed_tile = ws_shadow && tile != real_tile &&
+          ((segment_x < native_left && segment_x + curw > native_left) ||
+           (segment_x < native_right &&
+            segment_x + curw > native_right));
+      if (mixed_tile) {
+        PpuDrawMixed2bppTile(
+            ppu, dstz, layer, segment_x, source_offset, curw,
+            real_tile, (uint16)tile, tileadr0, tileadr1, zhi, zlo);
+        x += curw;
         dstz += curw;
+      } else {
+        int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+        PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+        uint32 bits = READ_BITS(ta, tile & 0x3ff);
+        if (bits) {
+          z += ((tile & 0x1c00) >> kPaletteShift);
+          if (tile & 0x4000) {
+            bits >>= (x & 7), x += curw;
+            do DO_PIXEL(0); while (bits >>= 1, dstz++, --curw);
+          } else {
+            bits <<= (x & 7), x += curw;
+            do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --curw);
+          }
+        } else {
+          x += curw;
+          dstz += curw;
+        }
       }
     }
     // Handle full tiles in the middle
     while (w >= 8) {
-      uint32 tile = *tp;
+      const int segment_x = ws_sx;
+      const uint16 real_tile = *tp;
+      uint32 tile = WS_TILE(real_tile, ws_sx);
       NEXT_TP();
+      if (ws_shadow && tile != real_tile &&
+          ((segment_x < native_left && segment_x + 8 > native_left) ||
+           (segment_x < native_right &&
+            segment_x + 8 > native_right))) {
+        PpuDrawMixed2bppTile(
+            ppu, dstz, layer, segment_x, 0, 8,
+            real_tile, (uint16)tile, tileadr0, tileadr1, zhi, zlo);
+        dstz += 8, w -= 8, ws_sx += 8;
+        continue;
+      }
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -1356,11 +1576,22 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, b
           DO_PIXEL_HFLIP(4); DO_PIXEL_HFLIP(5); DO_PIXEL_HFLIP(6); DO_PIXEL_HFLIP(7);
         }
       }
-      dstz += 8, w -= 8;
+      dstz += 8, w -= 8, ws_sx += 8;
     }
     // Handle remaining clipped part
     if (w) {
-      uint32 tile = *tp;
+      const int segment_x = ws_sx;
+      const uint16 real_tile = *tp;
+      uint32 tile = WS_TILE(real_tile, ws_sx);
+      if (ws_shadow && tile != real_tile &&
+          ((segment_x < native_left && segment_x + (int)w > native_left) ||
+           (segment_x < native_right &&
+            segment_x + (int)w > native_right))) {
+        PpuDrawMixed2bppTile(
+            ppu, dstz, layer, segment_x, 0, (int)w,
+            real_tile, (uint16)tile, tileadr0, tileadr1, zhi, zlo);
+        continue;
+      }
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -1374,6 +1605,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, b
       }
     }
   }
+#undef WS_TILE
 #undef NEXT_TP
 #undef READ_BITS
 #undef DO_PIXEL
@@ -1386,7 +1618,7 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
                                           PpuPixelPrioBufs *dstbuf, uint y,
                                           bool sub, uint layer,
                                           PpuZbufType zhi, PpuZbufType zlo) {
-  const int screen_y = (int)y;
+  const uint visible_y = y;
 #define VIEWPORT_ALLOWED(i) \
   PpuViewportAllows(ppu, layer, \
       (int)(dstz + (i) - dstbuf->data - kPpuExtraLeftRight), \
@@ -1404,14 +1636,16 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
   if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
     sc_offs += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
   const uint16 *tps[2] = {
-    &PpuRenderVram(ppu)[sc_offs & 0x7fff],
-    &PpuRenderVram(ppu)[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
+    &ppu->vram[sc_offs & 0x7fff],
+    &ppu->vram[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
   };
   int tileadr = PPU_bgTileAdr(ppu, layer), pixel;
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
   const uint16 *addr;
-  bool ws_shadow = WsShadowLayerActive(layer);
-#define WS_TILE(t, sx, span) (ws_shadow ? WsShadowTileDebug(layer, (sx), screen_y, (span), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - PpuRenderVram(ppu)), (uint16_t)(t)) : (uint32)(t))
+  bool ws_shadow = WsShadowLayerActive(layer) &&
+      !PpuWidescreenLayerRepeatBandActive(ppu, layer, (int)visible_y) &&
+      !PpuWidescreenLayerRawBandActive(ppu, layer, (int)visible_y);
+#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, (uint16_t)ppu->hScroll[layer], (uint16_t)(tp - ppu->vram), (uint16_t)(t)) : (uint32)(t))
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
@@ -1427,7 +1661,7 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
     int w = mosaic_size - (sx - PpuMosaicAt(ppu, sx));
     do {
       w = IntMin(w, dstz_end - dstz);
-      uint32 tile = WS_TILE(*tp, ws_sx, w);
+      uint32 tile = WS_TILE(*tp, ws_sx);
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -1453,31 +1687,119 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
 #undef VIEWPORT_ALLOWED
 }
 
+// A fine-scrolled line can carry up to seven stale pixels at each native
+// endpoint (the partially visible tiles outside a bounded map's authored
+// columns). Period detection trusts only the interior between them.
+enum { kPpuRepeatEdgeRepairPixels = 7 };
+
+// Smallest tile-aligned period, at most 120 pixels, that the rendered
+// interior x=7..248 proves at least twice; 0 when the line proves none.
+static int PpuDetectLinePeriod(const PpuZbufType *src, int first,
+                               int last /* exclusive */) {
+  for (int period = 16; period <= 120; period += 8) {
+    bool matches = true;
+    for (int x = first; x + period < last; x++) {
+      if (src[x + kPpuExtraLeftRight] !=
+          src[x + period + kPpuExtraLeftRight]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches)
+      return period;
+  }
+  return 0;
+}
+
 // Merge one isolated layer into the live priority buffer, padding only that
 // layer's side margins so transparent pixels never duplicate lower layers or
 // sprites. `repeat` selects cyclic continuation; otherwise reflect the edge.
 static void PpuMergePaddedBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
                                      const PpuPixelPrioBufs *layerbuf,
-                                     bool repeat, bool full_budget) {
+                                     uint layer, bool repeat,
+                                     bool full_budget) {
   PpuZbufType *dst = dstbuf->data;
   const PpuZbufType *src = layerbuf->data;
   int left_extra = full_budget ? ppu->extraLeftRight : ppu->extraLeftCur;
   int right_extra = full_budget ? ppu->extraLeftRight : ppu->extraRightCur;
-  for (int x = 0; x < kPpuXPixels; x++) {
-    int i = x + kPpuExtraLeftRight;
-    if (src[i] > dst[i]) dst[i] = src[i];
+  // The authentic 4:3 window in screen columns. A presentation bias renders
+  // the layer with its scroll shifted, so the cartridge's own 256 columns sit
+  // at [-bias, 256-bias): a positive bias moves the first columns into the
+  // left margin and leaves the last `bias` native columns without authored
+  // content (a rolling ring's stale page), and a negative bias the reverse.
+  // Only columns inside that window are copied as rendered; everything else
+  // is continued from it. The isolated render extends its window by the
+  // authentic extra on the biased side (PpuWidescreenLayerExtra), so those
+  // columns exist in src; clamp to the render window regardless.
+  int bias = ppu->wsPresentationXBias;
+  if (bias > ppu->extraLeftCur) bias = ppu->extraLeftCur;
+  if (bias < -ppu->extraRightCur) bias = -ppu->extraRightCur;
+  const int a0 = -bias;
+  const int a1 = kPpuXPixels - bias;
+  // Which rendered columns are copied as they are. A 32-column map wraps at
+  // 256 pixels on hardware, so its native columns past the authentic window
+  // are that exact wrap and stay; a 64-column allocation holds a rolling
+  // ring whose page past the window is stale, so only the window is kept.
+  const bool wide_map = PPU_bgTilemapWider(ppu, layer) != 0;
+  const int copy_lo = wide_map ? a0 : IntMin(a0, 0);
+  const int copy_hi = wide_map ? a1 : IntMax(a1, kPpuXPixels);
+  // Columns that are both inside the cartridge's authentic window and inside
+  // the screen's own interior: the only pixels a period may be proven on and
+  // continued from. At bias 0 this is the plain 7..248 interior.
+  const int interior_first =
+      IntMax(kPpuRepeatEdgeRepairPixels, a0 + kPpuRepeatEdgeRepairPixels);
+  const int interior_last =
+      IntMin(kPpuXPixels - kPpuRepeatEdgeRepairPixels,
+             a1 - kPpuRepeatEdgeRepairPixels);
+  int repeat_period = ppu->wsLayerRepeatPeriod[layer];
+  int edge_repair = ppu->wsLayerRepeatEdgeRepair[layer];
+  if (repeat && repeat_period == 0 &&
+      (ppu->wsLayerRepeatAutoPeriod & (1u << layer))) {
+    repeat_period = PpuDetectLinePeriod(src, interior_first, interior_last);
+    edge_repair =
+        repeat_period != 0 &&
+        (ppu->wsLayerRepeatAutoEdgeRepair & (1u << layer))
+            ? kPpuRepeatEdgeRepairPixels
+            : 0;
   }
-  for (int x = -left_extra; x < 0; x++) {
-    int di = x + kPpuExtraLeftRight;
-    int sx = repeat ? kPpuXPixels + x : -x;
-    int si = sx + kPpuExtraLeftRight;
-    if (src[si] > dst[di]) dst[di] = src[si];
-  }
-  for (int x = kPpuXPixels;
-       x < kPpuXPixels + right_extra; x++) {
-    int di = x + kPpuExtraLeftRight;
-    int sx = repeat ? x - kPpuXPixels : kPpuXPixels * 2 - 2 - x;
-    int si = sx + kPpuExtraLeftRight;
+  if (repeat_period == 0)
+    repeat_period = kPpuXPixels;
+  // A period shorter than the line is continued from the interior copy of
+  // the pattern so a stale endpoint is never sampled into a margin. The full
+  // 256-pixel repeat keeps the authentic wrap of a 32-column map.
+  const bool interior_period = repeat && repeat_period < kPpuXPixels;
+  for (int x = -left_extra; x < kPpuXPixels + right_extra; x++) {
+    const int di = x + kPpuExtraLeftRight;
+    int sx;
+    if (x >= copy_lo && x < copy_hi) {
+      sx = x;
+      if (repeat && edge_repair != 0) {
+        if (x >= a0 && x < a0 + edge_repair)
+          sx += repeat_period;
+        else if (x < a1 && x >= a1 - edge_repair)
+          sx -= repeat_period;
+      }
+    } else if (x < copy_lo) {
+      if (interior_period)
+        sx = interior_first +
+             ((x - interior_first) % repeat_period + repeat_period) %
+                 repeat_period;
+      else if (repeat)
+        sx = a0 + ((x - a0) % repeat_period + repeat_period) % repeat_period;
+      else
+        sx = 2 * a0 - x;
+    } else {
+      if (interior_period)
+        sx = (interior_last - repeat_period) +
+             (x - (interior_last - repeat_period)) % repeat_period;
+      else if (repeat)
+        sx = a0 + (x - a0) % repeat_period;
+      else
+        sx = 2 * (a1 - 1) - x;
+    }
+    if (sx < -left_extra) sx = -left_extra;
+    if (sx >= kPpuXPixels + right_extra) sx = kPpuXPixels + right_extra - 1;
+    const int si = sx + kPpuExtraLeftRight;
     if (src[si] > dst[di]) dst[di] = src[si];
   }
 }
@@ -1532,7 +1854,7 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   if (stretch_band) {
     PpuMergeStretchedBackground(ppu, dstbuf, &layerbuf);
   } else {
-    PpuMergePaddedBackground(ppu, dstbuf, &layerbuf,
+    PpuMergePaddedBackground(ppu, dstbuf, &layerbuf, layer,
                              repeat_band ||
                              (ppu->wsLayerRepeat & (1u << layer)) != 0,
                              repeat_band);
@@ -1571,7 +1893,7 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   if (stretch_band) {
     PpuMergeStretchedBackground(ppu, dstbuf, &layerbuf);
   } else {
-    PpuMergePaddedBackground(ppu, dstbuf, &layerbuf,
+    PpuMergePaddedBackground(ppu, dstbuf, &layerbuf, layer,
                              repeat_band ||
                              (ppu->wsLayerRepeat & (1u << layer)) != 0,
                              repeat_band);
@@ -2147,13 +2469,19 @@ static int PpuAdjustWidescreenHudOamX(Ppu *ppu, uint8_t index, uint8_t y,
     else if (x >= ppu->wsHudRightStart && x < 256)
       x += right_extra;
   }
-  return x;
+  return x - ppu->wsPresentationXBias;
 }
 
 static int PpuDecodeOamX(Ppu *ppu, uint8_t index) {
   int x = ppu->oam[index] & 0xff;
   x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
-  if (x >= 256 + ppu->extraRightCur) {
+  /* A positive presentation bias shifts every object left by the bias, so
+   * the game places objects for the presented right margin up to the bias
+   * beyond the authentic margin. Those X values are still positive. */
+  const int positive_limit =
+      256 + ppu->extraRightCur +
+      (ppu->wsPresentationXBias > 0 ? ppu->wsPresentationXBias : 0);
+  if (x >= positive_limit) {
     x -= 512;
   } else if (x >= 256 && ppu->wsOamRightHintStrict) {
     int slot = index >> 1;

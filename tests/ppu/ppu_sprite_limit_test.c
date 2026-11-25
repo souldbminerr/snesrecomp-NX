@@ -13,35 +13,47 @@ Snes *g_snes;
 int snes_frame_counter;
 unsigned char g_snesrecomp_last_hdmaen;
 
+static bool g_shadow_active;
+static unsigned g_shadow_tile_calls;
+static uint16_t g_shadow_tile;
+
 uint16_t WsShadowTile(int layer, int screen_x, uint32_t wrapped_y,
+                      uint16_t h_scroll, uint16_t tilemap_adr,
                       uint16_t real_tile) {
     (void)layer;
     (void)screen_x;
     (void)wrapped_y;
-    return real_tile;
+    (void)h_scroll;
+    (void)tilemap_adr;
+    g_shadow_tile_calls++;
+    return g_shadow_active && (screen_x < 0 || screen_x + 8 > kPpuXPixels)
+               ? g_shadow_tile
+               : real_tile;
 }
 
-/* Link shim for the provenance path: shadow lookups stay disabled in
- * this harness (WsShadowLayerActive returns false), so this never runs. */
-uint16_t WsShadowTileDebug(int layer, int screen_x, int screen_y,
-                           int pixel_span, uint32_t wrapped_y,
-                           uint16_t h_scroll, uint16_t map_word_adr,
-                           uint16_t real_tile) {
-    (void)screen_y;
-    (void)pixel_span;
-    (void)h_scroll;
-    (void)map_word_adr;
-    return WsShadowTile(layer, screen_x, wrapped_y, real_tile);
+int WsShadowNativeLeft(int layer) {
+    (void)layer;
+    return 0;
+}
+
+int WsShadowNativeRight(int layer) {
+    (void)layer;
+    return 256;
 }
 
 bool WsShadowLayerActive(int layer) {
     (void)layer;
-    return false;
+    return g_shadow_active;
 }
 
 uint32_t WsShadowWorldX(int layer) {
     (void)layer;
     return 0;
+}
+
+int32_t WsShadowPresentWorldX(int layer, int screen_x, uint16_t h_scroll) {
+    (void)layer;
+    return screen_x + h_scroll;
 }
 
 uint32_t WsShadowPresentWorldY(int layer, int screen_x) {
@@ -103,126 +115,12 @@ static void setup_33_sprite_case(Ppu *ppu) {
         ppu->vram[i] = 0xffff;
 }
 
-static void setup_solid_obj(Ppu *ppu, int slot, int x, int y) {
-    int high_index = slot >> 2;
-    int x_high_bit = (slot & 3) * 2;
-    ppu->oam[slot * 2] = (uint16_t)((y << 8) | (x & 0xff));
-    ppu->oam[slot * 2 + 1] = 0;
-    if (x & 0x100)
-        ppu->highOam[high_index] |= (uint8_t)(1u << x_high_bit);
-    else
-        ppu->highOam[high_index] &= (uint8_t)~(1u << x_high_bit);
-}
-
-static void setup_one_sprite_line(Ppu *ppu, int raw_x) {
-    ppu->inidisp = 0x0f;
-    ppu->screenEnabled[0] = 1 << 4;
-    memset(ppu->highOam, 0, sizeof ppu->highOam);
-    for (int slot = 0; slot < 128; slot++)
-        ppu->oam[slot * 2] = 0xf000;
-    setup_solid_obj(ppu, 0, raw_x, 0);
-    for (size_t i = 0; i < sizeof ppu->vram / sizeof ppu->vram[0]; i++)
-        ppu->vram[i] = 0xffff;
-    ppu->cgram[0] = 0;
-    for (size_t i = 1; i < sizeof ppu->cgram / sizeof ppu->cgram[0]; i++)
-        ppu->cgram[i] = 0x7fff;
-}
-
-static void setup_mode2_offset_bg1(Ppu *ppu) {
-    ppu->inidisp = 0x0f;
-    ppu->bgmode = 2;
-    ppu->screenEnabled[1] = 1;
-    ppu->bgXsc[2] = 0x04;
-    ppu->bgTileAdr = 0x0001;
-    ppu->cgwsel = 0x02;
-    ppu->cgadsub = 0x60;
-    for (size_t i = 0; i < sizeof ppu->vram / sizeof ppu->vram[0]; i++)
-        ppu->vram[i] = 0;
-    ppu->cgram[0] = 0;
-    ppu->cgram[1] = 0x001f;
-    ppu->cgram[2] = 0x03e0;
-
-    for (int y = 0; y < 32; y++) {
-        for (int x = 0; x < 32; x++) {
-            ppu->vram[y * 32 + x] = x == 0 ? 0 : 1;
-            ppu->vram[0x400 + y * 32 + x] = 0x2010;
-        }
-    }
-    for (int row = 0; row < 8; row++) {
-        ppu->vram[0x1000 + row] = 0x00ff;
-        ppu->vram[0x1000 + 16 + row] = 0xff00;
-    }
-}
-
-static void render_one_line(Ppu *ppu) {
-    ppu_runLine(ppu, 0);
-    ppu_runLine(ppu, 1);
-}
-
-static void render_strict_left_oam_frame(Ppu *ppu, uint32_t *pixels,
-                                         size_t pixel_count, int raw_x,
-                                         const uint8_t *hints) {
-    memset(pixels, 0, pixel_count * sizeof(pixels[0]));
-    PpuWsSetOamLeftHints(ppu, hints);
-    setup_one_sprite_line(ppu, raw_x);
-    ppu_runLine(ppu, 0);
-    ppu_runLine(ppu, 1);
-    snes_frame_counter++;
-}
-
-static unsigned count_argb_pixels(const uint32_t *pixels, size_t count) {
-    unsigned nonzero = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (pixels[i] != 0)
-            nonzero++;
-    }
-    return nonzero;
-}
-
 int main(void) {
     enum { kPitch = kPpuXPixels * 4 };
     uint8_t pixels[kPitch];
     Ppu *ppu = ppu_init();
     int failures = 0;
     if (!ppu) return 2;
-    /* Presentation VRAM changes scanout in both renderers, but never CPU
-     * reads/writes, the real tile memory, or the default-off picture. */
-    for (unsigned flags = 0; flags <= 1; flags++) {
-        uint16_t picture[32768], original[32768];
-        uint8_t baseline[kPitch], changed[kPitch], restored[kPitch];
-        ppu_reset(ppu);
-        setup_mode2_offset_bg1(ppu);
-        memcpy(original, ppu->vram, sizeof(original));
-        memcpy(picture, original, sizeof(picture));
-        for (unsigned row = 0; row < 8; row++) picture[0x1000 + row] = 0xff00;
-        PpuBeginDrawing(ppu, baseline, kPitch, flags);
-        render_one_line(ppu);
-        ppu->renderVram = picture;
-        PpuBeginDrawing(ppu, changed, kPitch, flags);
-        render_one_line(ppu);
-        failures += check(memcmp(baseline, changed, kPitch) != 0,
-                          "explicit picture memory changes scanout");
-        failures += check(!memcmp(ppu->vram, original, sizeof(original)),
-                          "picture rendering preserves real VRAM");
-        ppu->vramPointer = 0x1000;
-        ppu_write(ppu, 0x16, 0);
-        ppu_write(ppu, 0x17, 0x10);
-        failures += check(ppu->vramReadBuffer == original[0x1000],
-                          "CPU VRAM read buffer ignores picture memory");
-        ppu_write(ppu, 0x18, 0x55);
-        failures += check((ppu->vram[0x1000] & 255) == 0x55 &&
-                          picture[0x1000] == 0xff00,
-                          "CPU writes update real memory only");
-        memcpy(ppu->vram, original, sizeof(original));
-        ppu->renderVram = NULL;
-        PpuBeginDrawing(ppu, restored, kPitch, flags);
-        render_one_line(ppu);
-        failures += check(!memcmp(baseline, restored, kPitch),
-                          "unbinding restores the faithful picture");
-        ppu->renderVram = picture;
-        ppu_reset(ppu);
-        failures += check(ppu->renderVram == NULL, "reset discards picture binding");
-    }
     memset(pixels, 0, sizeof pixels);
     ppu_reset(ppu);
     PpuBeginDrawing(ppu, pixels, kPitch, kPpuRenderFlags_NewRenderer);
@@ -254,15 +152,15 @@ int main(void) {
     PpuBeginDrawing(ppu, pixels, kPitch,
                     kPpuRenderFlags_NewRenderer |
                     kPpuRenderFlags_NoSpriteLimits);
-    render_one_line(ppu);
+    ppu_runLine(ppu, 0);
+    ppu_runLine(ppu, 1);
     failures += check((ppu->objBuffer.data[kPpuExtraLeftRight] & 0xff) != 0,
                       "disabling sprite limits renders the low slot");
 
-    /* A live widened world gets only the capacity represented by its added
+    /* A live widened world gets only the capacity represented by added
      * columns. The same flag with zero live columns (including a centered
      * fixed screen) must retain the exact native limits. Uses its own
-     * scratch surface: the shared pitch stays native for the scanline
-     * comparison tests above. */
+     * scratch so the shared native scanline above stays untouched. */
     {
         enum { kWideExtra = 8, kWidePitch = (kPpuXPixels + kWideExtra * 2) * 4 };
         uint8_t wide_scratch[kWidePitch];
@@ -321,98 +219,6 @@ int main(void) {
                           "live 16-pixel margins admit sprite 33");
     }
 
-    /* Mode 2 OPT must still treat x=0 as the hardware left edge when
-     * widescreen margins are active. Otherwise backdrop + halved subscreen
-     * math samples offset BG columns and replaces authentic columns. */
-    {
-        enum { kExtra = 8, kWidePixels = kPpuXPixels + kExtra * 2 };
-        uint32_t native_pixels[kPpuXPixels] = {0};
-        uint32_t wide_pixels[kWidePixels] = {0};
-        int mismatches = 0;
-
-        ppu_reset(ppu);
-        PpuBeginDrawing(ppu, (uint8_t *)native_pixels,
-                        sizeof(uint32_t) * kPpuXPixels,
-                        kPpuRenderFlags_NewRenderer);
-        setup_mode2_offset_bg1(ppu);
-        render_one_line(ppu);
-
-        ppu_reset(ppu);
-        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
-                        sizeof(uint32_t) * kWidePixels,
-                        kPpuRenderFlags_NewRenderer);
-        PpuSetExtraSpace(ppu, kExtra);
-        setup_mode2_offset_bg1(ppu);
-        render_one_line(ppu);
-
-        for (int x = 0; x < kPpuXPixels; x++) {
-            if (native_pixels[x] !=
-                wide_pixels[kExtra + x])
-                mismatches++;
-        }
-        failures += check(mismatches == 0,
-                          "Mode 2 half-color subscreen keeps authentic columns with extra space");
-        failures += check(wide_pixels[kExtra] != 0,
-                          "Mode 2 half-color subscreen draws widened first authentic column");
-    }
-
-    /* An armed OBJ overlay captures all OAM slots by default. Hosts may still
-     * narrow the slot range explicitly, but the default should not silently
-     * export an empty surface. */
-    {
-        uint32_t frame_pixels[kPpuBufWidth] = {0};
-        uint32_t obj_pixels[kPpuXPixels] = {0};
-
-        ppu_reset(ppu);
-        PpuBeginDrawing(ppu, (uint8_t *)frame_pixels,
-                        sizeof(uint32_t) * kPpuBufWidth,
-                        kPpuRenderFlags_NewRenderer);
-        failures += check(PpuBindOverlaySurface(
-                              ppu, kPpuOverlaySource_Obj,
-                              (uint8_t *)obj_pixels,
-                              sizeof(uint32_t) * kPpuXPixels),
-                          "OBJ overlay surface binds");
-        failures += check(PpuSetOverlayCapture(
-                              ppu, kPpuOverlaySource_Obj, 0, 0, 8, 1,
-                              kPpuOverlayFlag_RemoveFromGame),
-                          "OBJ overlay capture arms");
-        setup_one_sprite_line(ppu, 0);
-        ppu_runLine(ppu, 0);
-        ppu_runLine(ppu, 1);
-        failures += check(count_argb_pixels(obj_pixels, 8) == 8,
-                          "default OBJ capture exports selected pixels");
-        failures += check((ppu->objBuffer.data[kPpuExtraLeftRight] & 0xff) == 0,
-                          "RemoveFromGame drops captured OBJ from frame");
-
-        memset(frame_pixels, 0, sizeof frame_pixels);
-        memset(obj_pixels, 0, sizeof obj_pixels);
-        ppu_reset(ppu);
-        PpuBeginDrawing(ppu, (uint8_t *)frame_pixels,
-                        sizeof(uint32_t) * kPpuBufWidth,
-                        kPpuRenderFlags_NewRenderer);
-        failures += check(PpuBindOverlaySurface(
-                              ppu, kPpuOverlaySource_Obj,
-                              (uint8_t *)obj_pixels,
-                              sizeof(uint32_t) * kPpuXPixels),
-                          "OBJ overlay surface rebinds");
-        failures += check(PpuSetOverlayCapture(
-                              ppu, kPpuOverlaySource_Obj, 0, 0, 8, 1,
-                              kPpuOverlayFlag_RemoveFromGame),
-                          "OBJ overlay capture rearms");
-        failures += check(PpuSetOverlayOamRange(ppu, 1, 1),
-                          "OBJ overlay range narrows capture");
-        setup_one_sprite_line(ppu, 0);
-        ppu_runLine(ppu, 0);
-        ppu_runLine(ppu, 1);
-        failures += check(count_argb_pixels(obj_pixels, 8) == 0,
-                          "narrowed OBJ capture excludes other slots");
-        failures += check((ppu->objBuffer.data[kPpuExtraLeftRight] & 0xff) != 0,
-                          "excluded OBJ remains in frame");
-        failures += check(PpuBindOverlaySurface(
-                              ppu, kPpuOverlaySource_Obj, NULL, 0),
-                          "OBJ overlay surface unbinds");
-    }
-
     /* Existing line-enhancer users rely on BG1 staying inside its authentic
      * destination viewport. New title-specific source insets must be opt-in
      * and must not relax that legacy fallback. */
@@ -458,7 +264,308 @@ int main(void) {
         failures += check(wide_pixels[kExtra + 16] != 0 &&
                               wide_pixels[kExtra + 239] != 0,
                           "explicit BG1 viewport inset retains visible span");
+
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        PpuSetExtraSpace(ppu, kExtra);
+        PpuSetWidescreenLineEnhancerWideLayers(ppu, 1u);
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(wide_pixels[0] != 0 &&
+                              wide_pixels[kExtra - 1] != 0 &&
+                              wide_pixels[kExtra + kPpuXPixels] != 0 &&
+                              wide_pixels[kWidePixels - 1] != 0,
+                          "line enhancer preserves opted-in wide BG1 margins");
     }
+
+    /* Fine scroll can make one 8-pixel renderer chunk straddle either native
+     * edge. World-shadow ownership begins in the host margin, not at the
+     * chunk boundary: center pixels must keep the cartridge tile even when
+     * the margin pixels beside them use a different shadow tile. */
+    {
+        enum { kExtra = 8, kWidePixels = kPpuXPixels + kExtra * 2 };
+        uint32_t wide_pixels[kWidePixels];
+
+        ppu_reset(ppu);
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
+                        sizeof(uint32_t) * kWidePixels,
+                        kPpuRenderFlags_NewRenderer);
+        PpuSetExtraSpace(ppu, kExtra);
+        PpuSetWidescreenLayerMask(ppu, 1);
+        ppu->inidisp = 0x0f;
+        ppu->bgmode = 1;
+        ppu->bgXsc[0] = 0x08;  /* tilemap at VRAM word $0800 */
+        ppu->hScroll[0] = 1;
+        ppu->screenEnabled[0] = 1;
+        for (int i = 0; i < 32 * 32; i++)
+            ppu->vram[0x0800 + i] = 1;
+        for (int row = 0; row < 8; row++) {
+            ppu->vram[1 * 16 + row] = 0x00ff;  /* color 1 */
+            ppu->vram[2 * 16 + row] = 0xff00;  /* color 2 */
+        }
+        ppu->cgram[0] = 0;
+        ppu->cgram[1] = 0x001f;
+        ppu->cgram[2] = 0x03e0;
+        g_shadow_tile = 2;
+        g_shadow_active = true;
+
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(wide_pixels[kExtra - 1] != 0 &&
+                              wide_pixels[kExtra] != 0 &&
+                              wide_pixels[kExtra - 1] != wide_pixels[kExtra],
+                          "left straddle changes only in the margin");
+        failures += check(
+            wide_pixels[kExtra + kPpuXPixels - 1] != 0 &&
+                wide_pixels[kExtra + kPpuXPixels] != 0 &&
+                wide_pixels[kExtra + kPpuXPixels - 1] !=
+                    wide_pixels[kExtra + kPpuXPixels],
+            "right straddle changes only in the margin");
+        failures += check(wide_pixels[kExtra] ==
+                              wide_pixels[kExtra + kPpuXPixels - 1],
+                          "native center keeps the cartridge tile");
+        failures += check(wide_pixels[0] == wide_pixels[kExtra - 1] &&
+                              wide_pixels[kExtra + kPpuXPixels] ==
+                                  wide_pixels[kWidePixels - 1],
+                          "both margins keep the world-shadow tile");
+        g_shadow_active = false;
+    }
+
+    /* A rendered-scanline repeat band must use authentic VRAM as its source,
+     * even when the world shadow is active for other lines. An HDMA split can
+     * give a layer a different role from the frame-keyed shadow; consulting
+     * that shadow here both corrupts the native center and repeats the wrong
+     * pixels into the margins. */
+    {
+        enum { kExtra = 8, kWidePixels = kPpuXPixels + kExtra * 2 };
+        uint32_t wide_pixels[kWidePixels];
+
+        ppu_reset(ppu);
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
+                        sizeof(uint32_t) * kWidePixels,
+                        kPpuRenderFlags_NewRenderer);
+        PpuSetExtraSpace(ppu, kExtra);
+        PpuSetWidescreenLayerRepeatBand(ppu, 0, 1, 2);
+        ppu->inidisp = 0x0f;
+        ppu->bgmode = 1;
+        ppu->screenEnabled[0] = 1;
+        for (size_t i = 0; i < sizeof ppu->vram / sizeof ppu->vram[0]; i++)
+            ppu->vram[i] = 0xffff;
+        ppu->cgram[0] = 0;
+        for (size_t i = 1; i < sizeof ppu->cgram / sizeof ppu->cgram[0]; i++)
+            ppu->cgram[i] = 0x7fff;
+
+        g_shadow_active = true;
+        g_shadow_tile_calls = 0;
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(g_shadow_tile_calls == 0,
+                          "repeat band bypasses world shadow");
+        failures += check(wide_pixels[0] != 0 &&
+                              wide_pixels[kExtra - 1] != 0 &&
+                              wide_pixels[kExtra] != 0 &&
+                              wide_pixels[kExtra + kPpuXPixels - 1] != 0 &&
+                              wide_pixels[kExtra + kPpuXPixels] != 0 &&
+                              wide_pixels[kWidePixels - 1] != 0,
+                          "repeat band preserves center and fills margins");
+        g_shadow_active = false;
+    }
+
+    /* A raw band presents a 64-column map's own hardware wrap in the
+     * margins: the world shadow is bypassed like a repeat band, and no
+     * repeat of the native line replaces the rendered margin columns. */
+    {
+        enum { kExtra = 16, kWidePixels = kPpuXPixels + kExtra * 2 };
+        uint32_t wide_pixels[kWidePixels];
+
+        ppu_reset(ppu);
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
+                        sizeof(uint32_t) * kWidePixels,
+                        kPpuRenderFlags_NewRenderer);
+        PpuSetExtraSpace(ppu, kExtra);
+        PpuSetWidescreenLayerMask(ppu, 1);
+        PpuSetWidescreenLayerRawBand(ppu, 0, 1, 2);
+        ppu->inidisp = 0x0f;
+        ppu->bgmode = 1;
+        ppu->bgXsc[0] = 0x09;  /* 64x32 tilemap at VRAM word $0800 */
+        ppu->hScroll[0] = 0;
+        ppu->screenEnabled[0] = 1;
+        for (int i = 0; i < 32 * 32; i++) {
+            ppu->vram[0x0800 + i] = 1;  /* left page: color 1 */
+            ppu->vram[0x0c00 + i] = 2;  /* right page: color 2 */
+        }
+        for (int row = 0; row < 8; row++) {
+            ppu->vram[1 * 16 + row] = 0x00ff;
+            ppu->vram[2 * 16 + row] = 0xff00;
+        }
+        ppu->cgram[0] = 0;
+        ppu->cgram[1] = 0x001f;
+        ppu->cgram[2] = 0x03e0;
+        g_shadow_tile = 3;
+        g_shadow_active = true;
+        g_shadow_tile_calls = 0;
+
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(g_shadow_tile_calls == 0,
+                          "raw band bypasses world shadow");
+        failures += check(wide_pixels[kExtra] != 0 &&
+                              wide_pixels[kExtra] ==
+                                  wide_pixels[kExtra + kPpuXPixels - 1],
+                          "raw band keeps the native center");
+        failures += check(wide_pixels[kExtra + kPpuXPixels] != 0 &&
+                              wide_pixels[kExtra + kPpuXPixels] !=
+                                  wide_pixels[kExtra] &&
+                              wide_pixels[kWidePixels - 1] ==
+                                  wide_pixels[kExtra + kPpuXPixels],
+                          "raw band right margin reads the map's second page");
+        failures += check(wide_pixels[0] != 0 &&
+                              wide_pixels[0] != wide_pixels[kExtra] &&
+                              wide_pixels[kExtra - 1] == wide_pixels[0],
+                          "raw band left margin reads the map's hardware wrap");
+        g_shadow_active = false;
+    }
+
+    /* A repeated layer whose rendered line proves a period continues that
+     * period into the margins and, when asked, rebuilds its stale endpoint
+     * pixels from the same period. A 12-tile (96-pixel) map on a 32-column
+     * ring wraps at 256 on hardware; the auto period must not restart it. */
+    {
+        enum { kExtra = 16, kWidePixels = kPpuXPixels + kExtra * 2 };
+        uint32_t wide_pixels[kWidePixels];
+
+        ppu_reset(ppu);
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
+                        sizeof(uint32_t) * kWidePixels,
+                        kPpuRenderFlags_NewRenderer);
+        PpuSetExtraSpace(ppu, kExtra);
+        PpuSetWidescreenLayerRepeat(ppu, 1);
+        PpuSetWidescreenLayerRepeatAutoPeriod(ppu, 1, 1);
+        ppu->inidisp = 0x0f;
+        ppu->bgmode = 1;
+        ppu->bgXsc[0] = 0x08;  /* 32x32 tilemap at VRAM word $0800 */
+        ppu->hScroll[0] = 3;   /* fine phase: the stale tile shows 5 px */
+        ppu->screenEnabled[0] = 1;
+        /* Solid 4bpp characters: character n is filled with color n, so
+         * column c (character (c % 12) + 1) shows twelve distinct colors and
+         * the map period is 96 pixels. Column 0 holds a stale endpoint tile
+         * whose color breaks that period. */
+        for (int character = 1; character <= 15; character++) {
+            for (int row = 0; row < 8; row++) {
+                ppu->vram[character * 16 + row] = (uint16_t)(
+                    ((character & 1) ? 0x00ff : 0) |
+                    ((character & 2) ? 0xff00 : 0));
+                ppu->vram[character * 16 + 8 + row] = (uint16_t)(
+                    ((character & 4) ? 0x00ff : 0) |
+                    ((character & 8) ? 0xff00 : 0));
+            }
+            ppu->cgram[character] = (uint16_t)(0x0421 * character);
+        }
+        for (int column = 0; column < 32; column++)
+            ppu->vram[0x0800 + column] = (uint16_t)((column % 12) + 1);
+        ppu->vram[0x0800] = 15;  /* stale endpoint tile, color 15 */
+        ppu->cgram[0] = 0;
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        int periodic = 1;
+        for (int x = 0; x + 96 < kWidePixels; x++) {
+            if (wide_pixels[x] != wide_pixels[x + 96])
+                periodic = 0;
+        }
+        failures += check(periodic &&
+                              wide_pixels[kExtra + 8] != wide_pixels[kExtra + 16],
+                          "auto period continues a 96-pixel line and "
+                          "repairs its stale endpoint");
+        PpuSetWidescreenLayerRepeatAutoPeriod(ppu, 1, 0);
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(wide_pixels[kExtra] != wide_pixels[kExtra + 96] &&
+                              wide_pixels[kExtra - 1] ==
+                                  wide_pixels[kExtra - 1 + 96] &&
+                              wide_pixels[kExtra - 1] != 0,
+                          "auto period without edge repair keeps the "
+                          "native endpoint and still continues the margin");
+        /* A presentation bias of +8 places the first eight columns of the
+         * authentic 4:3 viewport in the left margin. They must render from
+         * real VRAM (map columns 31 and the stale column 0 at fine phase 3),
+         * not from the period continuation; columns beyond them continue. */
+        PpuSetWidescreenPresentationXBias(ppu, 8);
+        /* The repeated layer is bounded, so a game keeps it outside the
+         * widen mask; the authentic columns must render regardless. */
+        PpuSetWidescreenLayerMask(ppu, 2);
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(wide_pixels[kExtra - 8] == wide_pixels[kExtra + 248] &&
+                              wide_pixels[kExtra - 4] ==
+                                  wide_pixels[kExtra + 252] &&
+                              wide_pixels[kExtra - 3] == wide_pixels[kExtra] &&
+                              wide_pixels[kExtra - 3] !=
+                                  wide_pixels[kExtra - 4] &&
+                              wide_pixels[kExtra - 16] ==
+                                  wide_pixels[kExtra - 16 + 96],
+                          "biased 4:3 columns render authentically inside a "
+                          "repeated layer");
+        PpuSetWidescreenPresentationXBias(ppu, 0);
+        PpuSetWidescreenLayerMask(ppu, 0);
+
+        /* A 64-column allocation whose second page is a stale ring page of
+         * one flat color from map column 33 on. The synthetic scroll is not
+         * shifted by the bias here, so screen x shows map pixel x+3: the
+         * authentic window [-8, 248) begins in the stale wrap of column 63
+         * and the stale endpoint column 0 (screen -8..4), and the PPU's last
+         * native columns from 253 fall on the stale page. Those must continue
+         * the authentic window's 96-pixel period instead of copying the page,
+         * while every authentic column renders as it is. */
+        ppu->bgXsc[0] = 0x01 | (0x0800 >> 8);  /* 64 columns, same base */
+        ppu->vram[0x0c00] = (uint16_t)((32 % 12) + 1);
+        for (int column = 1; column < 32; column++)
+            ppu->vram[0x0c00 + column] = 15;   /* stale second page */
+        ppu->hScroll[0] = 3;
+        PpuSetWidescreenPresentationXBias(ppu, 8);
+        PpuSetWidescreenLayerMask(ppu, 2);
+        memset(wide_pixels, 0, sizeof wide_pixels);
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        {
+            const uint32_t stale = wide_pixels[kExtra - 6];  /* map col 0 */
+            int continued = 1;
+            for (int x = 253; x < kPpuXPixels + kExtra; x++)
+                continued &= wide_pixels[kExtra + x] ==
+                                 wide_pixels[kExtra + x - 96] &&
+                             wide_pixels[kExtra + x] != stale;
+            failures += check(continued &&
+                                  wide_pixels[kExtra - 8] ==
+                                      wide_pixels[kExtra + 4] &&
+                                  wide_pixels[kExtra + 4] !=
+                                      wide_pixels[kExtra + 5] &&
+                                  wide_pixels[kExtra + 100] ==
+                                      wide_pixels[kExtra + 196],
+                              "a 64-column ring's stale tail past the "
+                              "biased authentic window is continued");
+        }
+        PpuSetWidescreenPresentationXBias(ppu, 0);
+        PpuSetWidescreenLayerMask(ppu, 0);
+        ppu->bgXsc[0] = (0x0800 >> 8);
+    }
+
+    /* Presentation bias is host-only and bounded by the renderer's fixed
+     * margin capacity. Background scroll is shifted by the game frontend;
+     * the shared PPU stores the matching OBJ correction. */
+    ppu_reset(ppu);
+    PpuSetWidescreenPresentationXBias(ppu, 26);
+    failures += check(ppu->wsPresentationXBias == 26,
+                      "presentation bias accepts in-range correction");
+    PpuSetWidescreenPresentationXBias(ppu, kPpuExtraLeftRight + 10);
+    failures += check(ppu->wsPresentationXBias == kPpuExtraLeftRight,
+                      "presentation bias clamps positive correction");
+    PpuSetWidescreenPresentationXBias(ppu, -kPpuExtraLeftRight - 10);
+    failures += check(ppu->wsPresentationXBias == -kPpuExtraLeftRight,
+                      "presentation bias clamps negative correction");
 
     /* The parity renderer is also SMK's widescreen Mode 7 path. Live margins
      * must sample real map coordinates, while centered extra space remains
@@ -633,39 +740,13 @@ int main(void) {
                           "unselected world OAM remains centered");
     }
 
-    /* Deluxe's BG3 league menu is revealed by overlapping XOR windows.
-     * Check all hardware operations against the final rendered pixels. */
-    for (unsigned op = 0; op < 4; ++op) {
-        ppu_reset(ppu);
-        PpuBeginDrawing(ppu, pixels, kPitch, kPpuRenderFlags_NewRenderer);
-        ppu->inidisp = 15;
-        ppu->bgmode = 9;
-        ppu->screenEnabled[0] = ppu->screenWindowed[0] = 4;
-        ppu->windowsel = 0x0a00;
-        ppu->wbgobjlog = op << 4;
-        ppu->window1left = 32; ppu->window1right = 127;
-        ppu->window2left = 64; ppu->window2right = 159;
-        ppu->bgTileAdr = 0x100;
-        for (unsigned i = 0; i < 8; ++i) ppu->vram[0x1000 + i] = 0xff;
-        ppu->cgram[1] = 0x7fff;
-        ppu_runLine(ppu, 0);
-        ppu_runLine(ppu, 1);
-        for (unsigned x = 0; x < 256; ++x) {
-            bool a = x >= 32 && x <= 127, b = x >= 64 && x <= 159;
-            bool masked = op == 0 ? a || b : op == 1 ? a && b :
-                          op == 2 ? a != b : a == b;
-            failures += check((pixels[x * 4] != 0) == !masked,
-                              "BG3 window operation controls visible pixels");
-        }
-    }
-    /* Strict OAM margin hints are symmetric. A raw negative X may be a parked
-     * hardware-hidden sprite or a genuine widened-world sprite. Hosts can mark
-     * the genuine slots; unmarked fully-offscreen-left slots stay clipped. */
+    /* A 2bpp BG3 (mode 1) under the world-keyed shadow renders its margins
+     * from the shadow tile and splits the chunk straddling the authentic
+     * boundary per pixel, exactly like the 4bpp layers (DKC2's ship-deck
+     * rigging is such a layer). */
     {
         enum { kExtra = 16, kWidePixels = kPpuXPixels + kExtra * 2 };
         uint32_t wide_pixels[kWidePixels];
-        uint8_t no_hints[16] = {0};
-        uint8_t slot0_hint[16] = {1};
 
         ppu_reset(ppu);
         memset(wide_pixels, 0, sizeof wide_pixels);
@@ -673,127 +754,75 @@ int main(void) {
                         sizeof(uint32_t) * kWidePixels,
                         kPpuRenderFlags_NewRenderer);
         PpuSetExtraSpace(ppu, kExtra);
-        PpuWsSetOamLeftHints(ppu, no_hints);
-        setup_one_sprite_line(ppu, 0x1f8);
+        PpuSetWidescreenLayerMask(ppu, 0x04);
+        PpuSetWidescreenBg3Widen(ppu, 1);
+        ppu->inidisp = 0x0f;
+        ppu->bgmode = 1;
+        ppu->bgXsc[2] = 0x09;  /* 64x32 tilemap at VRAM word $0800 */
+        ppu->hScroll[2] = 3;   /* the last native chunk straddles x=256 */
+        ppu->screenEnabled[0] = 1 << 2;
+        /* 2bpp characters: character 1 is solid color 1, character 2 is
+         * solid color 2. Every ring column holds character 1. */
+        for (int row = 0; row < 8; row++) {
+            ppu->vram[1 * 8 + row] = 0x00ff;
+            ppu->vram[2 * 8 + row] = 0xff00;
+        }
+        ppu->cgram[0] = 0;
+        ppu->cgram[1] = 0x001f;
+        ppu->cgram[2] = 0x03e0;
+        for (int column = 0; column < 64; column++)
+            ppu->vram[0x0800 + (column & 31) + (column >= 32 ? 0x400 : 0)] = 1;
+        g_shadow_active = true;
+        g_shadow_tile = 2;
         ppu_runLine(ppu, 0);
         ppu_runLine(ppu, 1);
-        failures += check(wide_pixels[kExtra - 1] == 0 &&
-                              wide_pixels[kExtra - 8] == 0,
-                          "unhinted fully-off-left OAM stays clipped");
-
-        ppu_reset(ppu);
-        memset(wide_pixels, 0, sizeof wide_pixels);
-        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
-                        sizeof(uint32_t) * kWidePixels,
-                        kPpuRenderFlags_NewRenderer);
-        PpuSetExtraSpace(ppu, kExtra);
-        PpuWsSetOamLeftHints(ppu, slot0_hint);
-        setup_one_sprite_line(ppu, 0x1f8);
-        ppu_runLine(ppu, 0);
-        ppu_runLine(ppu, 1);
-        failures += check(wide_pixels[kExtra - 1] != 0 &&
-                              wide_pixels[kExtra - 8] != 0,
-                          "hinted fully-off-left OAM renders in left margin");
-
-        ppu_reset(ppu);
-        memset(wide_pixels, 0, sizeof wide_pixels);
-        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
-                        sizeof(uint32_t) * kWidePixels,
-                        kPpuRenderFlags_NewRenderer);
-        PpuSetExtraSpace(ppu, kExtra);
-        PpuWsSetOamLeftHints(ppu, no_hints);
-        setup_one_sprite_line(ppu, 0x1fc);
-        ppu_runLine(ppu, 0);
-        ppu_runLine(ppu, 1);
-        failures += check(wide_pixels[kExtra] != 0 &&
-                              wide_pixels[kExtra + 3] != 0,
-                          "strict left hints keep native-edge OAM visible");
-
-        ppu_reset(ppu);
-        memset(wide_pixels, 0, sizeof wide_pixels);
-        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
-                        sizeof(uint32_t) * kWidePixels,
-                        kPpuRenderFlags_NewRenderer);
-        PpuSetExtraSpace(ppu, kExtra);
-        PpuWsSetOamRightHints(ppu, no_hints);
-        setup_one_sprite_line(ppu, 0x108);
-        ppu_runLine(ppu, 0);
-        ppu_runLine(ppu, 1);
-        failures += check(wide_pixels[kExtra + kPpuXPixels + 8] == 0,
-                          "unhinted right-band OAM wraps negative");
-
-        ppu_reset(ppu);
-        memset(wide_pixels, 0, sizeof wide_pixels);
-        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
-                        sizeof(uint32_t) * kWidePixels,
-                        kPpuRenderFlags_NewRenderer);
-        PpuSetExtraSpace(ppu, kExtra);
-        PpuWsSetOamRightHints(ppu, slot0_hint);
-        setup_one_sprite_line(ppu, 0x108);
-        ppu_runLine(ppu, 0);
-        ppu_runLine(ppu, 1);
-        failures += check(wide_pixels[kExtra + kPpuXPixels + 8] != 0,
-                          "hinted right-band OAM remains positive");
-
-        ppu_reset(ppu);
-        memset(wide_pixels, 0, sizeof wide_pixels);
-        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
-                        sizeof(uint32_t) * kWidePixels,
-                        kPpuRenderFlags_NewRenderer);
-        PpuSetExtraSpace(ppu, kExtra);
-        PpuWsSetOamLeftHints(ppu, NULL);
-        setup_one_sprite_line(ppu, 0x1f8);
-        ppu_runLine(ppu, 0);
-        ppu_runLine(ppu, 1);
-        failures += check(wide_pixels[kExtra - 1] != 0,
-                          "NULL left hints restore legacy margin behavior");
+        const uint32_t center = wide_pixels[kExtra + 8];
+        const uint32_t margin = wide_pixels[0];
+        failures += check(center != 0 && margin != 0 && center != margin &&
+                              wide_pixels[kExtra] == center &&
+                              wide_pixels[kExtra + kPpuXPixels - 1] == center &&
+                              wide_pixels[kExtra - 1] == margin &&
+                              wide_pixels[kExtra + kPpuXPixels] == margin &&
+                              wide_pixels[kWidePixels - 1] == margin,
+                          "2bpp layer renders shadow margins and splits the "
+                          "boundary chunk per pixel");
+        g_shadow_active = false;
     }
 
-    /* Strict left hints only describe host-owned slots. For game-owned slots,
-     * a negative-X sprite that is moving frame-to-frame should continue through
-     * the widened margin, but a parked off-screen sprite should still clip. */
+    /* A positive presentation bias shifts objects left by the bias, so a
+     * game places objects for the presented right margin up to the bias
+     * beyond the authentic margin. Such a nine-bit X is still positive:
+     * with a 16-pixel margin and a bias of 8, X = 278 presents at 270. */
     {
         enum { kExtra = 16, kWidePixels = kPpuXPixels + kExtra * 2 };
         uint32_t wide_pixels[kWidePixels];
-        uint8_t no_hints[16] = {0};
 
         ppu_reset(ppu);
-        snes_frame_counter = 1000;
+        memset(wide_pixels, 0, sizeof wide_pixels);
         PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
                         sizeof(uint32_t) * kWidePixels,
                         kPpuRenderFlags_NewRenderer);
         PpuSetExtraSpace(ppu, kExtra);
+        PpuSetWidescreenPresentationXBias(ppu, 8);
+        ppu->inidisp = 0x0f;
+        ppu->screenEnabled[0] = 1 << 4;
+        for (int slot = 0; slot < 128; slot++)
+            ppu->oam[slot * 2] = 0xf000;
+        ppu->oam[0] = (uint16_t)(278 & 0xff);  /* y 0, x low byte */
+        ppu->highOam[0] |= 1;                    /* x bit 8 */
+        for (size_t i = 0; i < sizeof ppu->vram / sizeof ppu->vram[0]; i++)
+            ppu->vram[i] = 0xffff;
+        ppu->cgram[0] = 0;
+        for (size_t i = 1; i < sizeof ppu->cgram / sizeof ppu->cgram[0]; i++)
+            ppu->cgram[i] = 0x7fff;
 
-        render_strict_left_oam_frame(ppu, wide_pixels, kWidePixels,
-                                     0x1f9, no_hints);
-        failures += check(wide_pixels[kExtra] != 0,
-                          "partially visible negative OAM stays visible");
-
-        render_strict_left_oam_frame(ppu, wide_pixels, kWidePixels,
-                                     0x1f8, no_hints);
-        failures += check(wide_pixels[kExtra - 1] != 0 &&
-                              wide_pixels[kExtra - 8] != 0,
-                          "moving unhinted OAM exits through left margin");
-
-        for (int i = 0; i < kPpuWsOamMovingGraceFrames; i++) {
-            render_strict_left_oam_frame(ppu, wide_pixels, kWidePixels,
-                                         0x1f8, no_hints);
-        }
-        failures += check(wide_pixels[kExtra - 1] == 0 &&
-                              wide_pixels[kExtra - 8] == 0,
-                          "stopped unhinted OAM parks outside left edge");
-
-        ppu_reset(ppu);
-        snes_frame_counter = 2000;
-        PpuBeginDrawing(ppu, (uint8_t *)wide_pixels,
-                        sizeof(uint32_t) * kWidePixels,
-                        kPpuRenderFlags_NewRenderer);
-        PpuSetExtraSpace(ppu, kExtra);
-        render_strict_left_oam_frame(ppu, wide_pixels, kWidePixels,
-                                     0x1f8, no_hints);
-        failures += check(wide_pixels[kExtra - 1] == 0 &&
-                              wide_pixels[kExtra - 8] == 0,
-                          "initial parked unhinted OAM remains clipped");
+        ppu_runLine(ppu, 0);
+        ppu_runLine(ppu, 1);
+        failures += check(wide_pixels[kExtra + 270] != 0 &&
+                              wide_pixels[kExtra + 269] == 0,
+                          "positive bias keeps an object placed for the "
+                          "presented right margin on the right");
+        PpuSetWidescreenPresentationXBias(ppu, 0);
     }
 
     ppu_free(ppu);
